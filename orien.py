@@ -7,26 +7,32 @@ import os
 # =========================
 # ① 画像読み込み & 前処理
 # =========================
-base_dir = os.path.dirname(__file__)
-map_path = os.path.join(base_dir, "map.png")
+# 【修正】orien.py が今どこに置かれているか、そのフォルダの絶対パスを自動取得する
+current_dir = os.path.dirname(os.path.abspath(__file__))
+map_path = os.path.join(current_dir, "map.png")
 
-#3. 絶対パスを使って画像を読み込む
-# Streamlit Cloud上の絶対パスを直接指定
-map_path = "/mount/src/orienteering.app/map.png"
-img = cv2.imread("map.png")
+img = cv2.imread(map_path)
 
-# 万が一読み込めなかった場合に、どこを探しているかを画面に出力して止める
+# =====================# 安全装置（デバッグ用メッセージを強化）
 if img is None:
-    import streamlit as st
-    st.error(f"画像が見つかりません。探したパス: {map_path}")
+    st.error(f"画像が見つかりません。")
+    st.write(f"プログラムが今いる場所（current_dir）: {current_dir}")
+    st.write(f"探したファイルのフルパス（map_path）: {map_path}")
+    
+    # フォルダの中に何があるかを画面にリストアップして原因を突き止める
+    if os.path.exists(current_dir):
+        st.write("同じフォルダ内にあるファイル一覧:", os.listdir(current_dir))
+    else:
+        st.write("指定されたフォルダ自体が存在しません。")
     st.stop()
+
 
 hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
 h, w = img.shape[:2]
 
-# =========================
-# ② 色マスク作成
+
+    # ② 色マスク作成
 # =========================
 
 # 白（走りやすい）
