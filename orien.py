@@ -2,10 +2,15 @@
 import cv2
 import numpy as np
 import heapq
+import os
 
 # =========================
 # ① 画像読み込み & 前処理
 # =========================
+base_dir = os.path.dirname(__file__)
+map_path = os.path.join(base_dir, "map.png")
+
+#3. 絶対パスを使って画像を読み込む
 img = cv2.imread("map.png")
 hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
