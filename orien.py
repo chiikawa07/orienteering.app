@@ -11,7 +11,16 @@ base_dir = os.path.dirname(__file__)
 map_path = os.path.join(base_dir, "map.png")
 
 #3. 絶対パスを使って画像を読み込む
+# Streamlit Cloud上の絶対パスを直接指定
+map_path = "/mount/src/orienteering.app/map.png"
 img = cv2.imread("map.png")
+
+# 万が一読み込めなかった場合に、どこを探しているかを画面に出力して止める
+if img is None:
+    import streamlit as st
+    st.error(f"画像が見つかりません。探したパス: {map_path}")
+    st.stop()
+
 hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
 h, w = img.shape[:2]
