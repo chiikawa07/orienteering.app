@@ -112,13 +112,24 @@ if uploaded_file is not None:
         return path[::-1]
 
     # =========================
-    # ⑧ スタート・ゴール設定
     # =========================
-    start = (int(h*scale*0.1), int(w*scale*0.1))
-    goal  = (int(h*scale*0.8), int(w*scale*0.8))
+    # ⑧ スタート・ゴール設定（スライダー化）
+    # =========================
+    st.sidebar.header("スタート・ゴールの調整")
+    sy = st.sidebar.slider("スタートの縦位置 (%)", 0, 100, 15)
+    sx = st.sidebar.slider("スタートの横位置 (%)", 0, 100, 20)
+    gy = st.sidebar.slider("ゴールの縦位置 (%)", 0, 100, 80)
+    gx = st.sidebar.slider("ゴールの横位置 (%)", 0, 100, 70)
 
-    path = dijkstra(small_cost, start, goal)
+    # スライダーのパーセント値を座標に変換
+    start = (int(h * scale * (sy / 100)), int(w * scale * (sx / 100)))
+    goal  = (int(h * scale * (gy / 100)), int(w * scale * (gx / 100)))
 
+    # もし壁（9999）の中にスタート/ゴールが設定された場合の安全装置
+    if small_cost[start[0], start[1]] >= 9999 or small_cost[goal[0], goal[1]] >= 9999:
+        st.error("スタートまたはゴールが通行不可エリア（黒い線や枠外）にあります。スライダーを動かしてください。")
+    else:
+        path = dijkstra(small_cost, start, goal)
     # =========================
     # ⑨ 可視化 (元の画像に太い線を引く)
     # =========================
