@@ -14,13 +14,37 @@ if uploaded_file is not None:
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     # =========================
-    # ① 画像読み込み & 前処理（縮小）
+    # =========================
+    # ① 画像読み込み & 前処理（K-Meansによる自動色整理）
     # =========================
     scale = 0.2
     small_img = cv2.resize(img, (0,0), fx=scale, fy=scale)
+    
+    st.sidebar.markdown("---")
+    use_kmeans = st.sidebar.checkbox("🤖 AIで色を自動整理する (K-Means減色)", value=False)
+    
+    if use_kmeans:
+        with st.spinner("AIが画像の主要な色を抽出・整理中..."):
+            # 画像を1次元のピクセルリストに変形
+            Z = small_img.reshape((-1, 3))
+            Z = np.float32(Z)
+            
+            # K-Meansを実行（K=6色に分類）
+            K = 6
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+            ret, label, center = cv2.kmeans(Z, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+            
+            # 抽出された6色（中心色）を使って元の画像を塗り直す
+            center = np.uint8(center)
+            res = center[label.flatten()]
+            small_img = res.reshape(small_img.shape)
+            
+            st.sidebar.success("画像を6色に自動圧縮しました！")
+            st.sidebar.image(small_img, channels="BGR", caption="減色後のクッキリした地図")
+
+    # 整理された画像（または元の画像）をHSVに変換
     hsv_small = cv2.cvtColor(small_img, cv2.COLOR_BGR2HSV)
     h_s, w_s = small_img.shape[:2]
-
     # =========================
     # ② 色マスク作成（ISOM基準のチューニング）
     # =========================
