@@ -6,7 +6,7 @@ import streamlit as st
 # ==========================================
 # UI: タイトルとアップローダー
 # ==========================================
-st.title("オリエンテーリング ルート解析AI (ISOM対応版)")
+st.title("オリエンテーリングAI (完全自動化版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -14,69 +14,68 @@ if uploaded_file is not None:
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     # =========================
-    # =========================
-    # ① 画像読み込み & 前処理（K-Meansによる自動色整理）
+    # ① 画像読み込み & K-Meansによる完全自動減色
     # =========================
     scale = 0.2
     small_img = cv2.resize(img, (0,0), fx=scale, fy=scale)
-    
-    st.sidebar.markdown("---")
-    use_kmeans = st.sidebar.checkbox("🤖 AIで色を自動整理する (K-Means減色)", value=False)
-    
-    if use_kmeans:
-        with st.spinner("AIが画像の主要な色を抽出・整理中..."):
-            # 画像を1次元のピクセルリストに変形
-            Z = small_img.reshape((-1, 3))
-            Z = np.float32(Z)
-            
-            # K-Meansを実行（K=6色に分類）
-            K = 6
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-            ret, label, center = cv2.kmeans(Z, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-            
-            # 抽出された6色（中心色）を使って元の画像を塗り直す
-            center = np.uint8(center)
-            res = center[label.flatten()]
-            small_img = res.reshape(small_img.shape)
-            
-            st.sidebar.success("画像を6色に自動圧縮しました！")
-            st.sidebar.image(small_img, channels="BGR", caption="減色後のクッキリした地図")
-
-    # 整理された画像（または元の画像）をHSVに変換
-    hsv_small = cv2.cvtColor(small_img, cv2.COLOR_BGR2HSV)
     h_s, w_s = small_img.shape[:2]
+
+    with st.spinner("AIが地図の色を解析・完全自動分類中..."):
+        # K-Meansを実行して画像を6色に圧縮
+        Z = small_img.reshape((-1, 3))
+        Z = np.float32(Z)
+        K = 6
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        ret, label, center = cv2.kmeans(Z, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        
+        center = np.uint8(center)
+        labels_reshaped = label.reshape((h_s, w_s))
+
+        # =========================
+        # ② ISOM基準色との自動マッチング (Lab色空間を使用)
+        # =========================
+        # AIに教え込む「理想の地図の色」 (BGR形式)
+        isom_colors = {
+            "white": np.array([245, 245, 245], dtype=np.uint8), # 森
+            "black": np.array([40, 40, 40], dtype=np.uint8),    # 道・建物
+            "yellow": np.array([80, 220, 240], dtype=np.uint8), # オープン
+            "green": np.array([90, 180, 110], dtype=np.uint8),  # ヤブ
+            "brown": np.array([60, 130, 180], dtype=np.uint8),  # 等高線
+            "blue": np.array([220, 120, 50], dtype=np.uint8)    # 水系
+        }
+
+        # 色の「距離」を正確に測るため、Lab色空間に変換
+        isom_lab = {k: cv2.cvtColor(np.array([[v]]), cv2.COLOR_BGR2LAB)[0][0] for k, v in isom_colors.items()}
+        center_lab = cv2.cvtColor(np.array([center]), cv2.COLOR_BGR2LAB)[0]
+
+        # 分類用の空マスクを用意
+        masks = {k: np.zeros((h_s, w_s), dtype=np.uint8) for k in isom_colors.keys()}
+
+        # 抽出された6色が、どのISOM色に一番近いかを自動判定
+        for i in range(K):
+            c_lab = center_lab[i]
+            min_dist = float('inf')
+            closest_name = "white"
+            for name, target_lab in isom_lab.items():
+                # 色の距離（違い）を計算
+                dist = np.linalg.norm(np.float32(c_lab) - np.float32(target_lab))
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_name = name
+            
+            # 一番近い色のマスクに割り当て
+            masks[closest_name][labels_reshaped == i] = 255
+
+        mask_white = masks["white"]
+        mask_black = masks["black"]
+        mask_yellow = masks["yellow"]
+        mask_green = masks["green"]
+        mask_brown = masks["brown"]
+        mask_blue = masks["blue"]
+
     # =========================
-    # ② 色マスク作成（ISOM基準のチューニング）
+    # ③〜④ 小径（点線）と建物（壁）の判別
     # =========================
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🎨 地図記号 色チューニング")
-    
-    w_v_min = st.sidebar.slider("白 (走行可能の森): 明るさ下限", 0, 255, 210)
-    w_s_max = st.sidebar.slider("白 (走行可能の森): 鮮やかさ上限", 0, 255, 12)
-    mask_white = cv2.inRange(hsv_small, (0, 0, w_v_min), (180, w_s_max, 255))
-
-    y_h_min = st.sidebar.slider("黄 (オープン): 色合い下限", 0, 180, 10)
-    y_h_max = st.sidebar.slider("黄 (オープン): 色合い上限", 0, 180, 30)
-    mask_yellow = cv2.inRange(hsv_small, (y_h_min, 30, 140), (y_h_max, 255, 255))
-
-    g_h_min = st.sidebar.slider("緑 (ヤブ): 色合い下限", 0, 180, 35)
-    mask_green = cv2.inRange(hsv_small, (g_h_min, 30, 50), (85, 255, 255))
-
-    # 茶色（等高線）
-    mask_brown = cv2.inRange(hsv_small, (10, 30, 50), (30, 150, 200))
-    
-    # 【新規追加】青（水系・通行不可または高コスト）
-    b_h_min = st.sidebar.slider("青 (水系): 色合い下限", 0, 180, 90)
-    b_h_max = st.sidebar.slider("青 (水系): 色合い上限", 0, 180, 130)
-    mask_blue = cv2.inRange(hsv_small, (b_h_min, 50, 50), (b_h_max, 255, 255))
-
-    # 黒（道・小径・崖・建物）
-    mask_black = cv2.inRange(hsv_small, (0, 0, 0), (180, 255, 90))
-
-    # =========================
-    # ③〜④ 小径（点線）と建物（壁）の高度な判別
-    # =========================
-    # モルフォロジー変換（Closing）で「途切れた点線」を繋いで一本の道にする
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask_black_closed = cv2.morphologyEx(mask_black, cv2.MORPH_CLOSE, kernel_close)
 
@@ -89,48 +88,40 @@ if uploaded_file is not None:
         x, y, w_rect, h_rect = cv2.boundingRect(cnt)
         ratio = max(w_rect, h_rect) / (min(w_rect, h_rect) + 1)
         
-        # 茶色(等高線)と重なっている黒は、等高線の数字などの可能性が高いので除外
         mask_roi = mask_brown[y:y+h_rect, x:x+w_rect]
         if cv2.countNonZero(mask_roi) > 0:
             continue
 
-        # 判別ロジック：面積が大きく、四角に近い塊は「建物（通行不可）」とする
         if area > 400 and ratio < 3.0:
             cv2.drawContours(wall_mask, [cnt], -1, 255, -1)
         else:
-            # 細長い線や、繋がった小さな点は「道・小径（爆速）」とする
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
     # =========================
-   # =========================
-    # ⑤ コストマップ生成（崖・等高線のペナルティを強化）
+    # ⑤ コストマップ生成（色チューニングスライダーを廃止！）
     # =========================
-    # サイドバーに等高線の「登りにくさ」を調整するスライダーを追加
     st.sidebar.markdown("---")
     st.sidebar.subheader("⛰️ 地形コスト（走りやすさ）の調整")
-    
-    # デフォルトを8.0（白の8倍遅い）に設定し、最大20.0まで上げられるようにする
+    st.sidebar.write("※色の認識はAIが完全自動で行いました。")
     brown_cost = st.sidebar.slider("茶 (等高線) のコスト (上げるほど崖を避けます)", 1.0, 20.0, 8.0, step=0.5)
 
     small_cost = np.full((h_s, w_s), 5.0)
-    small_cost[mask_white > 0] = 1.0         # 白：走りやすい森
-    small_cost[mask_yellow > 0] = 0.8        # 黄：オープン（最速の不整地）
-    small_cost[mask_brown > 0] = brown_cost  # ★修正：固定値ではなくスライダーの値を使用
-    small_cost[mask_green > 0] = 3.0         # 緑：ヤブ（遅い）
-    small_cost[road_mask > 0] = 0.5          # 道・小径：点線も含む（爆速）
-    
-    # 通行不可の絶対障害物
-    small_cost[wall_mask > 0] = 9999         # 建物・フェンス
-    small_cost[mask_blue > 0] = 9999         # 青：水系
+    small_cost[mask_white > 0] = 1.0
+    small_cost[mask_yellow > 0] = 0.8
+    small_cost[mask_brown > 0] = brown_cost
+    small_cost[mask_green > 0] = 3.0
+    small_cost[road_mask > 0] = 0.5
+    small_cost[wall_mask > 0] = 9999
+    small_cost[mask_blue > 0] = 9999
 
-    # 余白を使ったズル防止の壁
     margin = 15
     small_cost[0:margin, :] = 9999
     small_cost[-margin:, :] = 9999
     small_cost[:, 0:margin] = 9999
     small_cost[:, -margin:] = 9999
+
     # =========================
-    # ⑥ デバッグUI表示（水系と小径判別を追加）
+    # ⑥ デバッグUI表示
     # =========================
     st.sidebar.markdown("---")
     st.sidebar.subheader("AIの脳内マップ")
@@ -138,7 +129,7 @@ if uploaded_file is not None:
     cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
 
-    with st.sidebar.expander("🔍 AIの色認識テスト (ISOM)"):
+    with st.sidebar.expander("🔍 AIの完全自動色認識テスト"):
         st.image(mask_green, caption="緑（ヤブ）", use_container_width=True)
         st.image(mask_yellow, caption="黄（オープン）", use_container_width=True)
         st.image(mask_white, caption="白（森）", use_container_width=True)
@@ -224,7 +215,7 @@ if uploaded_file is not None:
                     "相対距離": route_dist
                 })
                 
-                # ペナルティ付与（見つけたルート周辺のコストを上げて別ルートを探させる）
+                # ペナルティ付与
                 for p in path:
                     y, x = p
                     y_min, y_max = max(0, y-4), min(h_s, y+5)
