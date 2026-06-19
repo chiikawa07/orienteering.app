@@ -19,15 +19,16 @@ if uploaded_file is not None:
     h, w = img.shape[:2]
 
     # =========================
-    # ② 色マスク作成
+   # ② 色マスク作成（黄色を追加）
     # =========================
-    # 白（走りやすい）
+    # 白（走りやすい森）
     mask_white = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
-    # 緑（遅い）
+    # 緑（遅い藪）
     mask_green = cv2.inRange(hsv, (35, 50, 50), (85, 255, 255))
+    # 黄色（オープン・走りやすい）★追加
+    mask_yellow = cv2.inRange(hsv, (15, 50, 50), (35, 255, 255))
     # 黒（道・崖）
     mask_black = cv2.inRange(hsv, (0, 0, 0), (180, 255, 50))
-
     # =========================
     # ③ 破線対応（膨張）
     # =========================
@@ -55,11 +56,20 @@ if uploaded_file is not None:
     # =========================
     # ⑤ コストマップ生成
     # =========================
-    cost = np.full((h, w), 5.0)  
-    cost[mask_white > 0] = 1.0
-    cost[mask_green > 0] = 3.0
-    cost[road_mask > 0] = 0.5
-    cost[wall_mask > 0] = 9999
+    cost = np.full((h, w), 5.0)  # 初期値（未知の色は激遅とする）
+    
+    cost[mask_white > 0] = 1.0   # 白：標準ペース
+    cost[mask_yellow > 0] = 0.8  # 黄色：オープンなので白より速い！
+    cost[mask_green > 0] = 3.0   # 緑：遅い
+    cost[road_mask > 0] = 0.5    # 道：爆速
+    cost[wall_mask > 0] = 9999   # 崖・建物：通行不可
+
+    # ★追加：ズル防止策（画像の上下左右の端っこ10ピクセルを「見えない壁」にする）
+    margin = 10
+    cost[0:margin, :] = 9999     # 上端を壁に
+    cost[-margin:, :] = 9999     # 下端を壁に
+    cost[:, 0:margin] = 9999     # 左端を壁に
+    cost[:, -margin:] = 9999     # 右端を壁に
 
     # =========================
     # ⑥ 軽量化（縮小）
