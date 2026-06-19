@@ -76,12 +76,23 @@ if uploaded_file is not None:
     small_cost[:, -margin:] = 9999
 
     # =========================
+   # =========================
     # ⑥ AIの脳内マップ可視化（サイドバー）
     # =========================
     st.sidebar.markdown("---")
     st.sidebar.subheader("AIの脳内マップ")
-    cost_visual = cv2.normalize(small_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    
+    # 【修正】9999（壁）のせいで他の色が真っ黒に潰れるのを防ぐため、上限を10でカットする
+    display_cost = np.clip(small_cost, 0, 10)
+    cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
+
+    # 【追加】AIの色認識が上手くいっているか確認するデバッグパネル
+    with st.sidebar.expander("🔍 AIの色認識テスト（デバッグ用）"):
+        st.write("白く光っている部分が、AIがその色だと認識した場所です。")
+        st.image(mask_green, caption="緑（藪）の認識", use_container_width=True)
+        st.image(mask_yellow, caption="黄色（オープン）の認識", use_container_width=True)
+        st.image(mask_white, caption="白（森）の認識", use_container_width=True)
 
     # =========================
     # ⑦ 経路探索アルゴリズム（ダイクストラ法）
