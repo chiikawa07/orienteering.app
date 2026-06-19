@@ -23,18 +23,29 @@ if uploaded_file is not None:
     h_s, w_s = small_img.shape[:2]
 
     # =========================
-    # ② 色マスク作成（地図の色を認識）
+   # =========================
+    # ② 色マスク作成（スライダーで動的に調整！）
     # =========================
-    # 白（走りやすい森）
-    mask_white = cv2.inRange(hsv_small, (0, 0, 180), (180, 25, 255))
-    # 黄色（オープン・走りやすい）
-    mask_yellow = cv2.inRange(hsv_small, (15, 30, 150), (35, 255, 255))
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎨 AIの色認識チューニング")
+    st.sidebar.write("デバッグ画面を見ながらスライダーを動かしてください")
+
+    # 白の条件（明るくて、色が薄い）
+    w_v_min = st.sidebar.slider("白: 明るさ(V)の最小値 (上げるほど白を厳しく判定)", 0, 255, 210)
+    w_s_max = st.sidebar.slider("白: 鮮やかさ(S)の最大値 (下げるほど白を厳しく判定)", 0, 255, 15)
+    mask_white = cv2.inRange(hsv_small, (0, 0, w_v_min), (180, w_s_max, 255))
+
+    # 黄色の条件（色合いHの範囲）
+    y_h_min = st.sidebar.slider("黄: 色合い(H)の下限", 0, 180, 10)
+    y_h_max = st.sidebar.slider("黄: 色合い(H)の上限", 0, 180, 30)
+    mask_yellow = cv2.inRange(hsv_small, (y_h_min, 40, 150), (y_h_max, 255, 255))
+
     # 緑（遅い藪）
-    mask_green = cv2.inRange(hsv_small, (35, 30, 50), (85, 255, 255))
+    g_h_min = st.sidebar.slider("緑: 色合い(H)の下限", 0, 180, 35)
+    mask_green = cv2.inRange(hsv_small, (g_h_min, 30, 50), (85, 255, 255))
+
     # 黒・茶色（等高線や道など）
     mask_black = cv2.inRange(hsv_small, (0, 0, 0), (180, 255, 120))
-
-    # =========================
     # ③ 破線対応（膨張処理）
     # =========================
     kernel = np.ones((3,3), np.uint8)
