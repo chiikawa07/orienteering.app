@@ -6,7 +6,7 @@ import streamlit as st
 # ==========================================
 # UI: タイトルとアップローダー
 # ==========================================
-st.title("オリエンテーリングAI (完全自動化版)")
+st.title("オリエンテーリングAI (アップダウン考慮版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -21,7 +21,6 @@ if uploaded_file is not None:
     h_s, w_s = small_img.shape[:2]
 
     with st.spinner("AIが地図の色を解析・完全自動分類中..."):
-        # K-Meansを実行して画像を6色に圧縮
         Z = small_img.reshape((-1, 3))
         Z = np.float32(Z)
         K = 6
@@ -32,38 +31,31 @@ if uploaded_file is not None:
         labels_reshaped = label.reshape((h_s, w_s))
 
         # =========================
-        # ② ISOM基準色との自動マッチング (Lab色空間を使用)
+        # ② ISOM基準色との自動マッチング (Lab色空間)
         # =========================
-        # AIに教え込む「理想の地図の色」 (BGR形式)
         isom_colors = {
-            "white": np.array([245, 245, 245], dtype=np.uint8), # 森
-            "black": np.array([40, 40, 40], dtype=np.uint8),    # 道・建物
-            "yellow": np.array([80, 220, 240], dtype=np.uint8), # オープン
-            "green": np.array([90, 180, 110], dtype=np.uint8),  # ヤブ
-            "brown": np.array([60, 130, 180], dtype=np.uint8),  # 等高線
-            "blue": np.array([220, 120, 50], dtype=np.uint8)    # 水系
+            "white": np.array([245, 245, 245], dtype=np.uint8),
+            "black": np.array([40, 40, 40], dtype=np.uint8),
+            "yellow": np.array([80, 220, 240], dtype=np.uint8),
+            "green": np.array([90, 180, 110], dtype=np.uint8),
+            "brown": np.array([60, 130, 180], dtype=np.uint8),
+            "blue": np.array([220, 120, 50], dtype=np.uint8)
         }
 
-        # 色の「距離」を正確に測るため、Lab色空間に変換
         isom_lab = {k: cv2.cvtColor(np.array([[v]]), cv2.COLOR_BGR2LAB)[0][0] for k, v in isom_colors.items()}
         center_lab = cv2.cvtColor(np.array([center]), cv2.COLOR_BGR2LAB)[0]
 
-        # 分類用の空マスクを用意
         masks = {k: np.zeros((h_s, w_s), dtype=np.uint8) for k in isom_colors.keys()}
 
-        # 抽出された6色が、どのISOM色に一番近いかを自動判定
         for i in range(K):
             c_lab = center_lab[i]
             min_dist = float('inf')
             closest_name = "white"
             for name, target_lab in isom_lab.items():
-                # 色の距離（違い）を計算
                 dist = np.linalg.norm(np.float32(c_lab) - np.float32(target_lab))
                 if dist < min_dist:
                     min_dist = dist
                     closest_name = name
-            
-            # 一番近い色のマスクに割り当て
             masks[closest_name][labels_reshaped == i] = 255
 
         mask_white = masks["white"]
@@ -98,22 +90,32 @@ if uploaded_file is not None:
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
     # =========================
-    # ⑤ コストマップ生成（色チューニングスライダーを廃止！）
+    # ⑤ 【NEW】等高線ヒートマップとコストマップ生成
     # =========================
     st.sidebar.markdown("---")
-    st.sidebar.subheader("⛰️ 地形コスト（走りやすさ）の調整")
-    st.sidebar.write("※色の認識はAIが完全自動で行いました。")
-    brown_cost = st.sidebar.slider("茶 (等高線) のコスト (上げるほど崖を避けます)", 1.0, 20.0, 8.0, step=0.5)
+    st.sidebar.subheader("⛰️ アップダウンの回避設定")
+    st.sidebar.write("数値を上げると、等高線が密集した急斜面を大きく避けて迂回するようになります。")
+    slope_weight = st.sidebar.slider("アップダウンを避ける強さ", 0.0, 100.0, 40.0, step=5.0)
 
+    # ★魔法のスパイス：等高線を大きくぼかして「斜面の険しさヒートマップ」を作る
+    slope_heatmap = cv2.GaussianBlur(mask_brown, (31, 31), 0)
+    # 密集している場所（255に近い）ほど、設定したslope_weightのペナルティが加算される
+    slope_penalty = (slope_heatmap / 255.0) * slope_weight
+
+    # 基本の地形コスト
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
     small_cost[mask_yellow > 0] = 0.8
-    small_cost[mask_brown > 0] = brown_cost
+    small_cost[mask_brown > 0] = 1.2  # 等高線自体も少し遅くする
     small_cost[mask_green > 0] = 3.0
     small_cost[road_mask > 0] = 0.5
     small_cost[wall_mask > 0] = 9999
     small_cost[mask_blue > 0] = 9999
 
+    # ★地形コストに「急斜面ペナルティ」を上乗せ！
+    small_cost = small_cost + slope_penalty
+
+    # 余白のズル防止壁
     margin = 15
     small_cost[0:margin, :] = 9999
     small_cost[-margin:, :] = 9999
@@ -121,7 +123,7 @@ if uploaded_file is not None:
     small_cost[:, -margin:] = 9999
 
     # =========================
-    # ⑥ デバッグUI表示
+    # ⑥ デバッグUI表示（ヒートマップ追加）
     # =========================
     st.sidebar.markdown("---")
     st.sidebar.subheader("AIの脳内マップ")
@@ -130,11 +132,10 @@ if uploaded_file is not None:
     st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
 
     with st.sidebar.expander("🔍 AIの完全自動色認識テスト"):
+        st.image(slope_heatmap, caption="🔥 急斜面ヒートマップ (白ほど急斜面)", use_container_width=True)
+        st.image(mask_brown, caption="茶（等高線）", use_container_width=True)
         st.image(mask_green, caption="緑（ヤブ）", use_container_width=True)
         st.image(mask_yellow, caption="黄（オープン）", use_container_width=True)
-        st.image(mask_white, caption="白（森）", use_container_width=True)
-        st.image(mask_brown, caption="茶（等高線）", use_container_width=True)
-        st.image(mask_blue, caption="青（水系）", use_container_width=True)
         st.image(road_mask, caption="黒（道・小径と認識した場所）", use_container_width=True)
 
     # =========================
@@ -192,7 +193,7 @@ if uploaded_file is not None:
     if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
         st.error("⚠️ スタートまたはゴールが通行不可エリアです。スライダーをずらしてください。")
     else:
-        with st.spinner('AIが地形と小径を考慮して複数ルートを探索中...'):
+        with st.spinner('AIが地形と「アップダウン」を考慮して複数ルートを探索中...'):
             routes = []
             metrics = []
             colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)] # 赤, 青, 緑
@@ -220,7 +221,7 @@ if uploaded_file is not None:
                     y, x = p
                     y_min, y_max = max(0, y-4), min(h_s, y+5)
                     x_min, x_max = max(0, x-4), min(w_s, x+5)
-                    search_cost[y_min:y_max, x_min:x_max] += 15.0
+                    search_cost[y_min:y_max, x_min:x_max] += 25.0 # 別ルートを探しやすくペナルティ増強
 
         if not routes:
             st.warning("⚠️ ルートが見つかりませんでした。")
