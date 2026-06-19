@@ -124,6 +124,11 @@ if uploaded_file is not None:
     # =========================
     vis = img.copy()
     scale_inv = int(1 / scale)
+# =========================
+    # ⑨ 可視化 (元の画像に太い線を引く)
+    # =========================
+    vis = img.copy()
+    scale_inv = int(1 / scale)
 
     for i in range(len(path) - 1):
         pt1 = (path[i][1] * scale_inv, path[i][0] * scale_inv)
