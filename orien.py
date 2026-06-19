@@ -111,49 +111,65 @@ if uploaded_file is not None:
         path.append(start)
         return path[::-1]
 
-    # =========================
-    # =========================
-# =========================
+   
     # ⑧ スタート・ゴール設定（スライダー化）
     # =========================
     st.sidebar.header("コントロールの設定")
-    sy = st.sidebar.slider("スタート Y位置 (%)", 0, 100, 15)
-    sx = st.sidebar.slider("スタート X位置 (%)", 0, 100, 20)
-    gy = st.sidebar.slider("ゴール Y位置 (%)", 0, 100, 80)
-    gx = st.sidebar.slider("ゴール X位置 (%)", 0, 100, 75)
+    sy = st.sidebar.slider("スタート Y位置 (%)", 0, 100, 50) # 初期値を中央付近に変更
+    sx = st.sidebar.slider("スタート X位置 (%)", 0, 100, 30)
+    gy = st.sidebar.slider("ゴール Y位置 (%)", 0, 100, 50)
+    gx = st.sidebar.slider("ゴール X位置 (%)", 0, 100, 70)
 
-    # 探索用座標（縮小スケール）
-    start = (int(h * scale * (sy / 100)), int(w * scale * (sx / 100)))
-    goal  = (int(h * scale * (gy / 100)), int(w * scale * (gx / 100)))
-
-    # パス計算
-    path = dijkstra(small_cost, start, goal)
-
-    # =========================
-    # ⑨ 可視化 (記号の描画)
-    # =========================
-    vis = img.copy()
-    scale_inv = int(1 / scale)
+    # 探索用座標（エラーを防ぐため、最大値を画像サイズ-1に制限）
+    start_y = min(int(h * scale * (sy / 100)), int(h * scale) - 1)
+    start_x = min(int(w * scale * (sx / 100)), int(w * scale) - 1)
+    goal_y  = min(int(h * scale * (gy / 100)), int(h * scale) - 1)
+    goal_x  = min(int(w * scale * (gx / 100)), int(w * scale) - 1)
     
-    # オリエンテーリングカラー (紫/マゼンタ)
-    purple = (255, 0, 255)
+    start = (start_y, start_x)
+    goal  = (goal_y, goal_x)
 
-    # 実サイズ座標の算出
-    orig_start = (int(w * sx / 100), int(h * sy / 100))
-    orig_goal = (int(w * gx / 100), int(h * gy / 100))
+    # 現在のコストをサイドバーに表示（デバッグ用）
+    st.sidebar.markdown("---")
+    st.sidebar.write(f"🟢 スタート地点のコスト: `{small_cost[start]}`")
+    st.sidebar.write(f"🔴 ゴール地点のコスト: `{small_cost[goal]}`")
 
-    # スタート地点を円で描画
-    cv2.circle(vis, orig_start, 30, purple, 5)
-    
-    # ゴール地点を二重円で描画 (Finish記号)
-    cv2.circle(vis, orig_goal, 30, purple, 5)
-    cv2.circle(vis, orig_goal, 18, purple, 3)
+    # 安全装置：壁（9999）の上にいる場合は計算しない
+    if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
+        st.error("⚠️ スタートまたはゴールが通行不可エリア（黒線や枠外）に配置されています。スライダーを少しずらしてください。")
+    else:
+        # 処理中であることを画面に示すスピナー
+        with st.spinner('AIがベストルートを探索中...'):
+            path = dijkstra(small_cost, start, goal)
 
-    # ルートを描画
-    for i in range(len(path) - 1):
-        pt1 = (path[i][1] * scale_inv, path[i][0] * scale_inv)
-        pt2 = (path[i+1][1] * scale_inv, path[i+1][0] * scale_inv)
-        cv2.line(vis, pt1, pt2, (0, 0, 255), thickness=4)
+        if not path or len(path) <= 1:
+            st.warning("⚠️ ルートが見つかりませんでした。完全に壁に囲まれている可能性があります。")
+        else:
+            # =========================
+            # ⑨ 可視化 (記号の描画)
+            # =========================
+            vis = img.copy()
+            scale_inv = int(1 / scale)
+            purple = (255, 0, 255)
+
+            # 実サイズ座標の算出
+            orig_start = (int(w * sx / 100), int(h * sy / 100))
+            orig_goal = (int(w * gx / 100), int(h * gy / 100))
+
+            # スタート地点を円で描画
+            cv2.circle(vis, orig_start, 30, purple, 5)
+            # ゴール地点を二重円で描画
+            cv2.circle(vis, orig_goal, 30, purple, 5)
+            cv2.circle(vis, orig_goal, 18, purple, 3)
+
+            # ルートを描画
+            for i in range(len(path) - 1):
+                pt1 = (path[i][1] * scale_inv, path[i][0] * scale_inv)
+                pt2 = (path[i+1][1] * scale_inv, path[i+1][0] * scale_inv)
+                cv2.line(vis, pt1, pt2, (0, 0, 255), thickness=4)
+
+            st.subheader("AI算出したベストルート")
+            st.image(vis, channels="BGR", caption="解析結果", use_container_width=True)
 # =========================
     # ⑨ 可視化 (元の画像に太い線を引く)
     # =========================
