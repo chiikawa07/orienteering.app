@@ -4,78 +4,75 @@ import heapq
 import streamlit as st
 
 # ==========================================
-# ① 画面からファイルを受け取る仕様
-# ==========================================
-st.title("オリエンテーリング ルート解析AI")
-uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
-
-if uploaded_file is not None:
-    # アップロードされたファイルをOpenCV形式に変換
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    # 既存の前処理
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    h, w = img.shape[:2]
+# =========================
+    # ① 画像読み込み & 前処理（★先に縮小して計算を安定させる）
+    # =========================
+    scale = 0.2
+    # 処理を爆速・高精度にするため、色を判定する前に画像を縮小する
+    small_img = cv2.resize(img, (0,0), fx=scale, fy=scale)
+    hsv_small = cv2.cvtColor(small_img, cv2.COLOR_BGR2HSV)
+    h_s, w_s = small_img.shape[:2]
 
     # =========================
-   # ② 色マスク作成（黄色を追加）
+    # ② 色マスク作成（★条件を厳しくする）
     # =========================
-    # 白（走りやすい森）
-    mask_white = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
-    # 緑（遅い藪）
-    mask_green = cv2.inRange(hsv, (35, 50, 50), (85, 255, 255))
-    # 黄色（オープン・走りやすい）★追加
-    mask_yellow = cv2.inRange(hsv, (15, 50, 50), (35, 255, 255))
-    # 黒（道・崖）
-    mask_black = cv2.inRange(hsv, (0, 0, 0), (180, 255, 50))
+    # 白（彩度Saturationの上限を40→25に下げて、本当に白い所だけにする）
+    mask_white = cv2.inRange(hsv_small, (0, 0, 180), (180, 25, 255))
+    
+    # 黄色（薄い黄色も拾えるように調整）
+    mask_yellow = cv2.inRange(hsv_small, (15, 30, 150), (35, 255, 255))
+    
+    # 緑
+    mask_green = cv2.inRange(hsv_small, (35, 30, 50), (85, 255, 255))
+    
+    # 黒・茶色（等高線や道。明るさValueの上限を上げて少し広めに拾う）
+    mask_black = cv2.inRange(hsv_small, (0, 0, 0), (180, 255, 120))
+
     # =========================
-    # ③ 破線対応（膨張）
+    # ③〜④ 黒を「道 or 崖」に分類
     # =========================
     kernel = np.ones((3,3), np.uint8)
     mask_black_dilated = cv2.dilate(mask_black, kernel, iterations=1)
-
-    # =========================
-    # ④ 黒を「道 or 崖」に分類
-    # =========================
     road_mask = np.zeros_like(mask_black)
     wall_mask = np.zeros_like(mask_black)
 
     contours, _ = cv2.findContours(mask_black_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     for cnt in contours:
         area = cv2.contourArea(cnt)
         x, y, cw, ch = cv2.boundingRect(cnt)
         ratio = max(cw, ch) / (min(cw, ch) + 1)
-
         if area < 100 and ratio > 3:
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
         else:
             cv2.drawContours(wall_mask, [cnt], -1, 255, -1)
 
     # =========================
-    # ⑤ コストマップ生成
+    # ⑤ コストマップ生成（★縮小サイズで直接作る）
     # =========================
-    cost = np.full((h, w), 5.0)  # 初期値（未知の色は激遅とする）
+    small_cost = np.full((h_s, w_s), 5.0)  # 初期値
     
-    cost[mask_white > 0] = 1.0   # 白：標準ペース
-    cost[mask_yellow > 0] = 0.8  # 黄色：オープンなので白より速い！
-    cost[mask_green > 0] = 3.0   # 緑：遅い
-    cost[road_mask > 0] = 0.5    # 道：爆速
-    cost[wall_mask > 0] = 9999   # 崖・建物：通行不可
+    small_cost[mask_white > 0] = 1.0
+    small_cost[mask_yellow > 0] = 0.8
+    small_cost[mask_green > 0] = 3.0
+    small_cost[road_mask > 0] = 0.5
+    small_cost[wall_mask > 0] = 9999
 
-    # ★追加：ズル防止策（画像の上下左右の端っこ10ピクセルを「見えない壁」にする）
-    margin = 10
-    cost[0:margin, :] = 9999     # 上端を壁に
-    cost[-margin:, :] = 9999     # 下端を壁に
-    cost[:, 0:margin] = 9999     # 左端を壁に
-    cost[:, -margin:] = 9999     # 右端を壁に
+    # ズル防止の見えない壁
+    margin = 5
+    small_cost[0:margin, :] = 9999
+    small_cost[-margin:, :] = 9999
+    small_cost[:, 0:margin] = 9999
+    small_cost[:, -margin:] = 9999
 
     # =========================
-    # ⑥ 軽量化（縮小）
+    # ⑥ 【新規】AIの脳内（コストマップ）をサイドバーに表示
     # =========================
-    scale = 0.2
-    small_cost = cv2.resize(cost, (0,0), fx=scale, fy=scale)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("AIの脳内マップ")
+    # コストの数値を画像の色（0〜255）に変換して可視化する
+    # 黒いほどコストが低く（速い）、白いほどコストが高い（遅い・壁）
+    cost_visual = cv2.normalize(small_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
 
     # =========================
     # ⑦ ダイクストラ法
