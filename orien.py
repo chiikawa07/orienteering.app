@@ -113,28 +113,47 @@ if uploaded_file is not None:
 
     # =========================
     # =========================
+# =========================
     # ⑧ スタート・ゴール設定（スライダー化）
     # =========================
-    st.sidebar.header("スタート・ゴールの調整")
-    sy = st.sidebar.slider("スタートの縦位置 (%)", 0, 100, 15)
-    sx = st.sidebar.slider("スタートの横位置 (%)", 0, 100, 20)
-    gy = st.sidebar.slider("ゴールの縦位置 (%)", 0, 100, 80)
-    gx = st.sidebar.slider("ゴールの横位置 (%)", 0, 100, 70)
+    st.sidebar.header("コントロールの設定")
+    sy = st.sidebar.slider("スタート Y位置 (%)", 0, 100, 15)
+    sx = st.sidebar.slider("スタート X位置 (%)", 0, 100, 20)
+    gy = st.sidebar.slider("ゴール Y位置 (%)", 0, 100, 80)
+    gx = st.sidebar.slider("ゴール X位置 (%)", 0, 100, 75)
 
-    # スライダーのパーセント値を座標に変換
+    # 探索用座標（縮小スケール）
     start = (int(h * scale * (sy / 100)), int(w * scale * (sx / 100)))
     goal  = (int(h * scale * (gy / 100)), int(w * scale * (gx / 100)))
 
-    # もし壁（9999）の中にスタート/ゴールが設定された場合の安全装置
-    if small_cost[start[0], start[1]] >= 9999 or small_cost[goal[0], goal[1]] >= 9999:
-        st.error("スタートまたはゴールが通行不可エリア（黒い線や枠外）にあります。スライダーを動かしてください。")
-    else:
-        path = dijkstra(small_cost, start, goal)
+    # パス計算
+    path = dijkstra(small_cost, start, goal)
+
     # =========================
-    # ⑨ 可視化 (元の画像に太い線を引く)
+    # ⑨ 可視化 (記号の描画)
     # =========================
     vis = img.copy()
     scale_inv = int(1 / scale)
+    
+    # オリエンテーリングカラー (紫/マゼンタ)
+    purple = (255, 0, 255)
+
+    # 実サイズ座標の算出
+    orig_start = (int(w * sx / 100), int(h * sy / 100))
+    orig_goal = (int(w * gx / 100), int(h * gy / 100))
+
+    # スタート地点を円で描画
+    cv2.circle(vis, orig_start, 30, purple, 5)
+    
+    # ゴール地点を二重円で描画 (Finish記号)
+    cv2.circle(vis, orig_goal, 30, purple, 5)
+    cv2.circle(vis, orig_goal, 18, purple, 3)
+
+    # ルートを描画
+    for i in range(len(path) - 1):
+        pt1 = (path[i][1] * scale_inv, path[i][0] * scale_inv)
+        pt2 = (path[i+1][1] * scale_inv, path[i+1][0] * scale_inv)
+        cv2.line(vis, pt1, pt2, (0, 0, 255), thickness=4)
 # =========================
     # ⑨ 可視化 (元の画像に太い線を引く)
     # =========================
