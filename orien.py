@@ -6,7 +6,7 @@ import streamlit as st
 # ==========================================
 # UI: タイトルとアップローダー
 # ==========================================
-st.title("オリエンテーリング ルート解析AI")
+st.title("オリエンテーリング ルート解析AI (ISOM対応版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -22,59 +22,76 @@ if uploaded_file is not None:
     h_s, w_s = small_img.shape[:2]
 
     # =========================
-    # ② 色マスク作成（サイドバーでチューニング）
+    # ② 色マスク作成（ISOM基準のチューニング）
     # =========================
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🎨 AIの色認識チューニング")
+    st.sidebar.subheader("🎨 地図記号 色チューニング")
     
-    w_v_min = st.sidebar.slider("白: 明るさ(V)の最小値", 0, 255, 210)
-    w_s_max = st.sidebar.slider("白: 鮮やかさ(S)の最大値", 0, 255, 12)
+    w_v_min = st.sidebar.slider("白 (走行可能の森): 明るさ下限", 0, 255, 210)
+    w_s_max = st.sidebar.slider("白 (走行可能の森): 鮮やかさ上限", 0, 255, 12)
     mask_white = cv2.inRange(hsv_small, (0, 0, w_v_min), (180, w_s_max, 255))
 
-    y_h_min = st.sidebar.slider("黄: 色合い(H)の下限", 0, 180, 10)
-    y_h_max = st.sidebar.slider("黄: 色合い(H)の上限", 0, 180, 30)
+    y_h_min = st.sidebar.slider("黄 (オープン): 色合い下限", 0, 180, 10)
+    y_h_max = st.sidebar.slider("黄 (オープン): 色合い上限", 0, 180, 30)
     mask_yellow = cv2.inRange(hsv_small, (y_h_min, 30, 140), (y_h_max, 255, 255))
 
-    g_h_min = st.sidebar.slider("緑: 色合い(H)の下限", 0, 180, 35)
+    g_h_min = st.sidebar.slider("緑 (ヤブ): 色合い下限", 0, 180, 35)
     mask_green = cv2.inRange(hsv_small, (g_h_min, 30, 50), (85, 255, 255))
 
-    # 茶色（等高線）と黒（道・崖）
+    # 茶色（等高線）
     mask_brown = cv2.inRange(hsv_small, (10, 30, 50), (30, 150, 200))
+    
+    # 【新規追加】青（水系・通行不可または高コスト）
+    b_h_min = st.sidebar.slider("青 (水系): 色合い下限", 0, 180, 90)
+    b_h_max = st.sidebar.slider("青 (水系): 色合い上限", 0, 180, 130)
+    mask_blue = cv2.inRange(hsv_small, (b_h_min, 50, 50), (b_h_max, 255, 255))
+
+    # 黒（道・小径・崖・建物）
     mask_black = cv2.inRange(hsv_small, (0, 0, 0), (180, 255, 90))
 
     # =========================
-    # ③〜④ 破線対応と道判定
+    # ③〜④ 小径（点線）と建物（壁）の高度な判別
     # =========================
-    kernel = np.ones((3,3), np.uint8)
-    mask_black_dilated = cv2.dilate(mask_black, kernel, iterations=1)
+    # モルフォロジー変換（Closing）で「途切れた点線」を繋いで一本の道にする
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask_black_closed = cv2.morphologyEx(mask_black, cv2.MORPH_CLOSE, kernel_close)
+
     road_mask = np.zeros_like(mask_black)
     wall_mask = np.zeros_like(mask_black)
 
-    contours, _ = cv2.findContours(mask_black_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask_black_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        ratio = max(cw, ch) / (min(cw, ch) + 1)
-        if area < 100 and ratio > 3:
-            # 茶色(等高線)と被らない黒を道とする
-            mask_roi = mask_brown[y:y+ch, x:x+cw]
-            if cv2.countNonZero(mask_roi) == 0:
-                cv2.drawContours(road_mask, [cnt], -1, 255, -1)
-        else:
+        x, y, w_rect, h_rect = cv2.boundingRect(cnt)
+        ratio = max(w_rect, h_rect) / (min(w_rect, h_rect) + 1)
+        
+        # 茶色(等高線)と重なっている黒は、等高線の数字などの可能性が高いので除外
+        mask_roi = mask_brown[y:y+h_rect, x:x+w_rect]
+        if cv2.countNonZero(mask_roi) > 0:
+            continue
+
+        # 判別ロジック：面積が大きく、四角に近い塊は「建物（通行不可）」とする
+        if area > 400 and ratio < 3.0:
             cv2.drawContours(wall_mask, [cnt], -1, 255, -1)
+        else:
+            # 細長い線や、繋がった小さな点は「道・小径（爆速）」とする
+            cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
     # =========================
-    # ⑤ コストマップ生成（理想のルートへ誘導）
+    # ⑤ コストマップ生成（ISOM準拠のコスト設定）
     # =========================
     small_cost = np.full((h_s, w_s), 5.0)
-    small_cost[mask_white > 0] = 1.0       # 白
-    small_cost[mask_yellow > 0] = 0.8      # 黄（最速）
-    small_cost[mask_brown > 0] = 1.5       # 茶（等高線を横切ると遅い）
-    small_cost[mask_green > 0] = 3.0       # 緑
-    small_cost[road_mask > 0] = 0.5        # 道
-    small_cost[wall_mask > 0] = 9999       # 壁
+    small_cost[mask_white > 0] = 1.0       # 白：走りやすい森
+    small_cost[mask_yellow > 0] = 0.8      # 黄：オープン（最速の不整地）
+    small_cost[mask_brown > 0] = 1.5       # 茶：等高線（斜面のため減速）
+    small_cost[mask_green > 0] = 3.0       # 緑：ヤブ（遅い）
+    small_cost[road_mask > 0] = 0.5        # 道・小径：点線も含む（爆速）
+    
+    # 通行不可の絶対障害物
+    small_cost[wall_mask > 0] = 9999       # 建物・フェンス
+    small_cost[mask_blue > 0] = 9999       # 青：水系（今回は渡れないものとする）
 
-    # ズル防止策（右端や下端の余白を通らせないため、壁を厚く設定）
+    # 余白を使ったズル防止の壁
     margin = 15
     small_cost[0:margin, :] = 9999
     small_cost[-margin:, :] = 9999
@@ -82,7 +99,7 @@ if uploaded_file is not None:
     small_cost[:, -margin:] = 9999
 
     # =========================
-    # ⑥ デバッグUI表示
+    # ⑥ デバッグUI表示（水系と小径判別を追加）
     # =========================
     st.sidebar.markdown("---")
     st.sidebar.subheader("AIの脳内マップ")
@@ -90,11 +107,13 @@ if uploaded_file is not None:
     cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
 
-    with st.sidebar.expander("🔍 AIの色認識テスト"):
-        st.image(mask_green, caption="緑（藪）", use_container_width=True)
-        st.image(mask_yellow, caption="黄色（オープン）", use_container_width=True)
+    with st.sidebar.expander("🔍 AIの色認識テスト (ISOM)"):
+        st.image(mask_green, caption="緑（ヤブ）", use_container_width=True)
+        st.image(mask_yellow, caption="黄（オープン）", use_container_width=True)
         st.image(mask_white, caption="白（森）", use_container_width=True)
-        st.image(mask_brown, caption="茶色（等高線）", use_container_width=True)
+        st.image(mask_brown, caption="茶（等高線）", use_container_width=True)
+        st.image(mask_blue, caption="青（水系）", use_container_width=True)
+        st.image(road_mask, caption="黒（道・小径と認識した場所）", use_container_width=True)
 
     # =========================
     # ⑦ 経路探索アルゴリズム
@@ -151,7 +170,7 @@ if uploaded_file is not None:
     if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
         st.error("⚠️ スタートまたはゴールが通行不可エリアです。スライダーをずらしてください。")
     else:
-        with st.spinner('AIが複数のルートオプションを探索中...'):
+        with st.spinner('AIが地形と小径を考慮して複数ルートを探索中...'):
             routes = []
             metrics = []
             colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)] # 赤, 青, 緑
