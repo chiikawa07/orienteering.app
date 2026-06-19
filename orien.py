@@ -78,18 +78,26 @@ if uploaded_file is not None:
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
     # =========================
-    # ⑤ コストマップ生成（ISOM準拠のコスト設定）
+   # =========================
+    # ⑤ コストマップ生成（崖・等高線のペナルティを強化）
     # =========================
+    # サイドバーに等高線の「登りにくさ」を調整するスライダーを追加
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⛰️ 地形コスト（走りやすさ）の調整")
+    
+    # デフォルトを8.0（白の8倍遅い）に設定し、最大20.0まで上げられるようにする
+    brown_cost = st.sidebar.slider("茶 (等高線) のコスト (上げるほど崖を避けます)", 1.0, 20.0, 8.0, step=0.5)
+
     small_cost = np.full((h_s, w_s), 5.0)
-    small_cost[mask_white > 0] = 1.0       # 白：走りやすい森
-    small_cost[mask_yellow > 0] = 0.8      # 黄：オープン（最速の不整地）
-    small_cost[mask_brown > 0] = 1.5       # 茶：等高線（斜面のため減速）
-    small_cost[mask_green > 0] = 3.0       # 緑：ヤブ（遅い）
-    small_cost[road_mask > 0] = 0.5        # 道・小径：点線も含む（爆速）
+    small_cost[mask_white > 0] = 1.0         # 白：走りやすい森
+    small_cost[mask_yellow > 0] = 0.8        # 黄：オープン（最速の不整地）
+    small_cost[mask_brown > 0] = brown_cost  # ★修正：固定値ではなくスライダーの値を使用
+    small_cost[mask_green > 0] = 3.0         # 緑：ヤブ（遅い）
+    small_cost[road_mask > 0] = 0.5          # 道・小径：点線も含む（爆速）
     
     # 通行不可の絶対障害物
-    small_cost[wall_mask > 0] = 9999       # 建物・フェンス
-    small_cost[mask_blue > 0] = 9999       # 青：水系（今回は渡れないものとする）
+    small_cost[wall_mask > 0] = 9999         # 建物・フェンス
+    small_cost[mask_blue > 0] = 9999         # 青：水系
 
     # 余白を使ったズル防止の壁
     margin = 15
@@ -97,7 +105,6 @@ if uploaded_file is not None:
     small_cost[-margin:, :] = 9999
     small_cost[:, 0:margin] = 9999
     small_cost[:, -margin:] = 9999
-
     # =========================
     # ⑥ デバッグUI表示（水系と小径判別を追加）
     # =========================
