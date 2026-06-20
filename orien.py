@@ -134,21 +134,26 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     corners = cv2.goodFeaturesToTrack(road_mask, maxCorners=50, qualityLevel=0.1, minDistance=20)
     attack_points = [(int(cy), int(cx)) for cx, cy in (c.ravel() for c in corners)] if corners is not None else []
 
-    # ★NEW: オートクロップのための「地図のメインエリア」検出
-    # 茶色(等高線)、緑(森)、黒(道)、青(水)、紫(立入禁止)を合体
-    feature_mask = masks["brown"] | masks["green"] | masks["black"] | masks["blue"] | mask_magenta
-    # 巨大なカーネルで要素同士をくっつけ、1つの巨大な「地図の島」を作る
-    kernel_merge = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41))
-    merged_map = cv2.morphologyEx(feature_mask, cv2.MORPH_CLOSE, kernel_merge)
+    # ==========================================
+    # ★NEW: モルフォロジー変換による有機的な余白カット
+    # ==========================================
+    # 白以外の部分（色がある部分）をベースにする
+    non_white = cv2.bitwise_not(masks["white"])
+    # 収縮させて、タイトル文字などの「細い線や小さな塊」を消滅させる
+    kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    eroded = cv2.erode(non_white, kernel_erode)
+    # 膨張させて、残った等高線や森を1つの巨大な塊（地図の島）にくっつける
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41))
+    map_blob = cv2.dilate(eroded, kernel_dilate)
     
-    # 最も大きな塊（＝地図本体）の座標を取得
-    contours_map, _ = cv2.findContours(merged_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    auto_rect = (0, 0, w_s, h_s)
+    # 島の内部の穴を完全に塗りつぶす
+    contours_map, _ = cv2.findContours(map_blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    map_blob_filled = np.zeros_like(map_blob)
     if contours_map:
         largest_cnt = max(contours_map, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest_cnt)
-        pad = 20 # ギリギリで切れないように少し余裕をもたせる
-        auto_rect = (max(0, x - pad), max(0, y - pad), min(w_s, x + w + pad), min(h_s, y + h + pad))
+        cv2.drawContours(map_blob_filled, [largest_cnt], -1, 255, -1)
+    else:
+        map_blob_filled.fill(255)
 
     brown_blur = cv2.GaussianBlur(masks["brown"], (5, 5), 0)
     grad_x = cv2.Sobel(brown_blur, cv2.CV_32F, 1, 0, ksize=3)
@@ -171,7 +176,7 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     small_cost[masks["blue"] > 0] = 9999
     small_cost[mask_magenta_wall > 0] = 9999
 
-    return h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, auto_rect
+    return h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled
 
 def dijkstra(cost_map, gx_mat, gy_mat, g_mag, start, goal):
     h, w = cost_map.shape
@@ -209,6 +214,20 @@ def dijkstra(cost_map, gx_mat, gy_mat, g_mag, start, goal):
     path.append(start)
     return path[::-1]
 
+def snap_to_valid(pt, cost_map, max_r=50):
+    if cost_map[pt] < 9999: return pt
+    y, x = pt
+    h, w = cost_map.shape
+    for r in range(1, max_r):
+        for dy in range(-r, r+1):
+            for dx in range(-r, r+1):
+                if abs(dy) == r or abs(dx) == r:
+                    ny, nx = y+dy, x+dx
+                    if 0 <= ny < h and 0 <= nx < w:
+                        if cost_map[ny, nx] < 9999:
+                            return (ny, nx)
+    return pt
+
 # ==========================================
 # セッション初期化
 # ==========================================
@@ -240,29 +259,22 @@ if uploaded_file is not None:
 
     scale = 0.35
     file_bytes = bytes(uploaded_file.read())
-    (h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, auto_rect) = process_map_data(file_bytes, scale, 20.0, 3.0)
+    (h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled) = process_map_data(file_bytes, scale, 20.0, 3.0)
 
     with col_panel:
         point_type = st.radio("📌 地図をクリックして移動:", ["🔵 スタート", "🔴 ゴール"])
         
         with st.expander("✂️ 競技エリアの制限 (余白カット)", expanded=False):
             st.write("AIが余白を「森」と勘違いするのを防ぎます。")
-            # ★NEW: オートクロップの切り替えボタン
             use_auto_crop = st.checkbox("🤖 自動トリミングを有効にする", value=True)
             
             if use_auto_crop:
-                x1, y1, x2, y2 = auto_rect
-                t_m, b_m, l_m, r_m = y1, y2, x1, x2
-                st.info("自動トリミング適用中（地図上の黒枠線）")
+                st.info("自動トリミング適用中（地図上の暗い領域はAIが進入しません）")
             else:
                 crop_top = st.slider("上部のカット (%)", 0, 50, 0)
                 crop_bottom = st.slider("下部のカット (%)", 0, 50, 0)
                 crop_left = st.slider("左側のカット (%)", 0, 50, 0)
                 crop_right = st.slider("右側のカット (%)", 0, 50, 0)
-                t_m = int(h_s * (crop_top / 100))
-                b_m = int(h_s * (1 - crop_bottom / 100))
-                l_m = int(w_s * (crop_left / 100))
-                r_m = int(w_s * (1 - crop_right / 100))
 
         with st.expander("🎯 クリックが効かない場合の微調整", expanded=False):
             st.session_state.start_nx = st.slider("スタートの横位置 (X)", 0.0, 1.0, value=float(st.session_state.start_nx), step=0.01)
@@ -271,20 +283,29 @@ if uploaded_file is not None:
             st.session_state.goal_ny = st.slider("ゴールの縦位置 (Y)", 0.0, 1.0, value=float(st.session_state.goal_ny), step=0.01)
 
     search_cost = small_cost.copy()
-    search_cost[0:t_m, :] = 9999
-    search_cost[b_m:h_s, :] = 9999
-    search_cost[:, 0:l_m] = 9999
-    search_cost[:, r_m:w_s] = 9999
+    if use_auto_crop:
+        search_cost[map_blob_filled == 0] = 9999
+    else:
+        t_m = int(h_s * (crop_top / 100))
+        b_m = int(h_s * (1 - crop_bottom / 100))
+        l_m = int(w_s * (crop_left / 100))
+        r_m = int(w_s * (1 - crop_right / 100))
+        search_cost[0:t_m, :] = 9999
+        search_cost[b_m:h_s, :] = 9999
+        search_cost[:, 0:l_m] = 9999
+        search_cost[:, r_m:w_s] = 9999
 
     sx = max(0, min(int(st.session_state.start_nx * w_s), w_s - 1))
     sy = max(0, min(int(st.session_state.start_ny * h_s), h_s - 1))
     gx = max(0, min(int(st.session_state.goal_nx * w_s), w_s - 1))
     gy = max(0, min(int(st.session_state.goal_ny * h_s), h_s - 1))
-    start, goal = (sy, sx), (gy, gx)
+    
+    start = snap_to_valid((sy, sx), search_cost)
+    goal = snap_to_valid((gy, gx), search_cost)
 
     routes, metrics = [], []
     if search_cost[start] >= 9999 or search_cost[goal] >= 9999:
-        st.error("⚠️ スタートまたはゴールが『立入禁止エリア』または『カットされた余白』にあります。位置を調整してください。")
+        st.error("⚠️ スタートまたはゴールが『完全な場外』にあります。地図の内側をクリックしてください。")
     else:
         path1 = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, goal)
         if path1 and len(path1) > 1:
@@ -304,12 +325,23 @@ if uploaded_file is not None:
     h_orig, w_orig = vis.shape[:2]
     scale_inv = 1 / scale
 
-    t_orig, b_orig = int((t_m / h_s) * h_orig), int((b_m / h_s) * h_orig)
-    l_orig, r_orig = int((l_m / w_s) * w_orig), int((r_m / w_s) * w_orig)
-    cv2.rectangle(vis, (l_orig, t_orig), (r_orig, b_orig), (0, 0, 0), 4)
+    # ★NEW: 進入禁止エリア（トリミング部分）をグレーアウト＆黒い境界線で描画
+    if use_auto_crop:
+        map_blob_orig = cv2.resize(map_blob_filled, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+        vis[map_blob_orig == 0] = (vis[map_blob_orig == 0] * 0.4).astype(np.uint8)
+        contours_orig, _ = cv2.findContours(map_blob_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, contours_orig, -1, (0, 0, 0), 4)
+    else:
+        t_orig, b_orig = int((t_m / h_s) * h_orig), int((b_m / h_s) * h_orig)
+        l_orig, r_orig = int((l_m / w_s) * w_orig), int((r_m / w_s) * w_orig)
+        if t_orig > 0: vis[0:t_orig, :] = (vis[0:t_orig, :] * 0.4).astype(np.uint8)
+        if b_orig < h_orig: vis[b_orig:h_orig, :] = (vis[b_orig:h_orig, :] * 0.4).astype(np.uint8)
+        if l_orig > 0: vis[:, 0:l_orig] = (vis[:, 0:l_orig] * 0.4).astype(np.uint8)
+        if r_orig < w_orig: vis[:, r_orig:w_orig] = (vis[:, r_orig:w_orig] * 0.4).astype(np.uint8)
+        cv2.rectangle(vis, (l_orig, t_orig), (r_orig, b_orig), (0, 0, 0), 4)
 
-    orig_start = (int(st.session_state.start_nx * w_orig), int(st.session_state.start_ny * h_orig))
-    orig_goal = (int(st.session_state.goal_nx * w_orig), int(st.session_state.goal_ny * h_orig))
+    orig_start = (int(start[1] * scale_inv), int(start[0] * scale_inv))
+    orig_goal = (int(goal[1] * scale_inv), int(goal[0] * scale_inv))
 
     if 'best_ap' in locals() and best_ap: 
         cv2.circle(vis, (int(best_ap[1] * scale_inv), int(best_ap[0] * scale_inv)), 15, (255, 255, 0), 4)
