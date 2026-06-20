@@ -2,11 +2,13 @@ import cv2
 import numpy as np
 import heapq
 import streamlit as st
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# UI: タイトルとアップローダー
+# UI: タイトルとページ設定
 # ==========================================
-st.title("オリエンテーリングAI (アタックポイント抽出版)")
+st.set_page_config(layout="wide") # 地図を大きく見せるためにワイド表示
+st.title("オリエンテーリングAI (クリック座標指定版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -90,9 +92,8 @@ if uploaded_file is not None:
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
     # =========================
-    # ⑤ 【NEW】アタックポイント（特徴点）の自動抽出
+    # ⑤ アタックポイント（特徴点）の自動抽出
     # =========================
-    # 道の交差点や鋭いカーブを「Shi-Tomasiコーナー検出」で抽出する
     corners = cv2.goodFeaturesToTrack(road_mask, maxCorners=50, qualityLevel=0.1, minDistance=20)
     attack_points = []
     if corners is not None:
@@ -145,27 +146,7 @@ if uploaded_file is not None:
     small_cost[:, -margin:] = 9999
 
     # =========================
-    # ⑦ デバッグUI表示
-    # =========================
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("AIの脳内マップ")
-    display_cost = np.clip(small_cost, 0, 10)
-    cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
-
-    with st.sidebar.expander("🔍 AIの空間認識テスト"):
-        # 抽出したアタックポイントを道マスク上に可視化
-        ap_vis = cv2.cvtColor(road_mask, cv2.COLOR_GRAY2BGR)
-        for ap in attack_points:
-            cv2.circle(ap_vis, (ap[1], ap[0]), 3, (0, 255, 255), -1)
-        st.image(ap_vis, caption="📍 抽出されたアタックポイント候補 (道の分岐・角)", use_container_width=True)
-        
-        dist_color = cv2.normalize(dist_capped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        dist_color = cv2.applyColorMap(dist_color, cv2.COLORMAP_JET)
-        st.image(dist_color, caption="🗺️ ナビ不安度 (赤＝危険地帯)", use_container_width=True)
-
-    # =========================
-    # ⑧ 経路探索（異方性コスト対応ダイクストラ法）
+    # ⑦ 経路探索（異方性コスト対応ダイクストラ法）
     # =========================
     def dijkstra(cost_map, gx_mat, gy_mat, g_mag, c_weight, start, goal):
         h, w = cost_map.shape
@@ -212,29 +193,73 @@ if uploaded_file is not None:
         return path[::-1]
 
     # =========================
-    # ⑨ スライダーと「人間的アタックルート」の探索
+    # ⑧ 【NEW】直感的なクリックUIの実装
     # =========================
-    st.sidebar.header("コントロールの設定")
-    sy = st.sidebar.slider("スタート Y位置 (%)", 0, 100, 77)
-    sx = st.sidebar.slider("スタート X位置 (%)", 0, 100, 53)
-    gy = st.sidebar.slider("ゴール Y位置 (%)", 0, 100, 50)
-    gx = st.sidebar.slider("ゴール X位置 (%)", 0, 100, 70)
+    # クリック情報を保持するためのセッションステートを準備
+    if 'start_y' not in st.session_state:
+        st.session_state.start_y = int(h_s * 0.77)
+        st.session_state.start_x = int(w_s * 0.53)
+        st.session_state.goal_y = int(h_s * 0.50)
+        st.session_state.goal_x = int(w_s * 0.70)
+    if 'last_click' not in st.session_state:
+        st.session_state.last_click = None
 
-    start_y = min(int(h_s * (sy / 100)), h_s - 1)
-    start_x = min(int(w_s * (sx / 100)), w_s - 1)
-    goal_y  = min(int(h_s * (gy / 100)), h_s - 1)
-    goal_x  = min(int(w_s * (gx / 100)), w_s - 1)
-    start, goal = (start_y, start_x), (goal_y, goal_x)
+    st.markdown("---")
+    st.subheader("📍 スタートとゴールを地図上でクリックして設定")
+    
+    col_ui, col_map = st.columns([1, 2])
+    
+    with col_ui:
+        st.info("設定したい地点を選択し、右の地図をクリックしてください。")
+        point_type = st.radio("クリックで動かすポイント:", ["🔵 スタート", "🔴 ゴール"])
+    
+    with col_map:
+        # クリック用の画像を作成（現在の位置を紫色のマーカーで描画）
+        click_map_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
+        
+        # スタートの描画 (S)
+        cv2.circle(click_map_img, (st.session_state.start_x, st.session_state.start_y), 6, (255, 0, 255), -1)
+        cv2.putText(click_map_img, "S", (st.session_state.start_x + 8, st.session_state.start_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        
+        # ゴールの描画 (G - 二重丸)
+        cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 6, (255, 0, 255), 2)
+        cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 2, (255, 0, 255), -1)
+        cv2.putText(click_map_img, "G", (st.session_state.goal_x + 8, st.session_state.goal_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        
+        # 画像上でクリックイベントを取得
+        click_val = streamlit_image_coordinates(click_map_img, key="map_click")
 
+    # 新しい場所がクリックされたら座標を更新
+    if click_val is not None and click_val != st.session_state.last_click:
+        st.session_state.last_click = click_val
+        # 余白の壁(margin)をクリックしてエラーにならないよう、座標を安全な範囲に制限
+        safe_x = max(margin, min(click_val['x'], w_s - margin - 1))
+        safe_y = max(margin, min(click_val['y'], h_s - margin - 1))
+        
+        if point_type == "🔵 スタート":
+            st.session_state.start_x = safe_x
+            st.session_state.start_y = safe_y
+        else:
+            st.session_state.goal_x = safe_x
+            st.session_state.goal_y = safe_y
+        
+        # 画面を即座に再描画して変更を反映
+        st.rerun()
+
+    start = (st.session_state.start_y, st.session_state.start_x)
+    goal = (st.session_state.goal_y, st.session_state.goal_x)
+
+    # =========================
+    # ⑨ 経路探索実行
+    # =========================
     if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
-        st.error("⚠️ スタートまたはゴールが通行不可エリアです。スライダーをずらしてください。")
+        st.error("⚠️ スタートまたはゴールが通行不可エリアです。別の場所をクリックしてください。")
     else:
         with st.spinner('AIがアタックポイントを経由する人間的ルートを探索中...'):
             routes = []
             metrics = []
             colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)]
             
-            # 【第1ルート】純粋なAI最適解
             path1 = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, start, goal)
             if path1 and len(path1) > 1:
                 routes.append(path1)
@@ -245,15 +270,12 @@ if uploaded_file is not None:
                     "距離": len(path1)
                 })
 
-            # 【第2ルート】アタックポイント経由（人間的ルート）
             best_ap = None
             if attack_points:
-                # ゴールに最も近いアタックポイント（道の分岐）を探す
                 best_ap = min(attack_points, key=lambda p: np.hypot(p[0]-goal[0], p[1]-goal[1]))
             
             path2 = []
             if best_ap:
-                # スタートからAPまで、APからゴールまでの2段階でルートを引く
                 path_to_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, start, best_ap)
                 path_from_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, best_ap, goal)
                 if path_to_ap and path_from_ap:
@@ -266,7 +288,6 @@ if uploaded_file is not None:
                         "距離": len(path2)
                     })
 
-            # 【第3ルート】大穴ルート（第1ルートを避ける）
             if path1:
                 search_cost = small_cost.copy()
                 for p in path1:
@@ -295,14 +316,12 @@ if uploaded_file is not None:
             h_orig, w_orig = img.shape[:2]
             purple = (255, 0, 255)
 
-            orig_start = (int(w_orig * sx / 100), int(h_orig * sy / 100))
-            orig_goal = (int(w_orig * gx / 100), int(h_orig * gy / 100))
+            orig_start = (st.session_state.start_x * scale_inv, st.session_state.start_y * scale_inv)
+            orig_goal = (st.session_state.goal_x * scale_inv, st.session_state.goal_y * scale_inv)
 
-            # 地図上に抽出されたすべてのアタックポイントを小さな黄色い点で描画
             for ap in attack_points:
                 cv2.circle(vis, (ap[1] * scale_inv, ap[0] * scale_inv), 4, (0, 255, 255), -1)
 
-            # 選ばれた「最強のアタックポイント」を水色の二重丸で強調表示
             if best_ap:
                 orig_ap = (best_ap[1] * scale_inv, best_ap[0] * scale_inv)
                 cv2.circle(vis, orig_ap, 15, (255, 255, 0), 4)
