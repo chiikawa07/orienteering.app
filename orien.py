@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 # ==========================================
-# UI: ページ設定とカスタムCSS（Livelox風フルスクリーン化）
+# UI: ページ設定とカスタムCSS
 # ==========================================
 st.set_page_config(layout="wide", page_title="オリエンテーリングAI")
 
@@ -19,7 +19,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 2点間の球面距離(km)を計算
 def haversine_distance(p1, p2):
     R = 6371.0
     lat1, lon1 = np.radians(p1[0]), np.radians(p1[1])
@@ -30,14 +29,12 @@ def haversine_distance(p1, p2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
-# GPXの時間文字列をパースするヘルパー関数
 def parse_time(time_str):
     if not time_str: return None
     time_str = time_str.replace('Z', '+00:00')
     try: return datetime.fromisoformat(time_str)
     except: return None
 
-# GPXデータをセグメントごとに取得（緯度, 経度, 時間）
 def parse_gpx_data(file_bytes):
     try:
         root = ET.fromstring(file_bytes)
@@ -72,21 +69,16 @@ def parse_gpx_data(file_bytes):
         st.error(f"GPXファイルの解析に失敗しました: {e}")
         return []
 
-# ペース(min/km)から色(BGR)を生成する関数
 def get_color_for_pace(pace):
     if pace is None:
-        return (0, 180, 255) # 時間データがない場合はオレンジ
-    
-    fast_pace = 4.0   # 4 min/km (緑)
-    slow_pace = 15.0  # 15 min/km (赤 - 歩き・登り・停止)
-    
+        return (0, 180, 255) 
+    fast_pace = 4.0   
+    slow_pace = 15.0  
     ratio = (pace - fast_pace) / (slow_pace - fast_pace)
-    ratio = max(0.0, min(1.0, ratio)) # 0〜1の間に収める
-    
-    # 緑(速) -> 黄 -> 赤(遅) のグラデーション
+    ratio = max(0.0, min(1.0, ratio)) 
     g = int(255 * (1 - ratio))
     r = int(255 * ratio)
-    return (0, g, r) # B, G, R
+    return (0, g, r) 
 
 # ==========================================
 # 画像処理をキャッシュ化
@@ -189,7 +181,8 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     small_cost[wall_mask > 0] = 9999
     small_cost[mask_blue > 0] = 9999
 
-    margin = 20 
+    # 白フチ（余白）をAIが道と勘違いしないように、壁を厚く設定
+    margin = 40 
     small_cost[0:margin, :] = 9999
     small_cost[-margin:, :] = 9999
     small_cost[:, 0:margin] = 9999
@@ -269,7 +262,7 @@ if uploaded_file is not None:
     if 'last_click' not in st.session_state:
         st.session_state.last_click = None
 
-    margin = 20
+    margin = 40
     sx = max(margin, min(int(st.session_state.start_nx * w_s), w_s - margin - 1))
     sy = max(margin, min(int(st.session_state.start_ny * h_s), h_s - margin - 1))
     gx = max(margin, min(int(st.session_state.goal_nx * w_s), w_s - margin - 1))
@@ -338,16 +331,12 @@ if uploaded_file is not None:
         else:
             gpx_scale, gpx_rot, gpx_offset_x, gpx_offset_y = 1.0, 0, 0, 0
 
-    # ==========================================
-    # ★ GPS軌跡の「オートフィット」＆「スピード色分け描画」
-    # ==========================================
     if gpx_segments:
         all_lats = [p[0] for seg in gpx_segments for p in seg]
         all_lons = [p[1] for seg in gpx_segments for p in seg]
         center_lat = (min(all_lats) + max(all_lats)) / 2
         center_lon = (min(all_lons) + max(all_lons)) / 2
 
-        # 緯度・経度をメートル(m)の距離に変換する係数（メルカトル図法近似）
         avg_lat_rad = np.radians(center_lat)
         m_per_deg_lat = 111320.0
         m_per_deg_lon = 40075000.0 * np.cos(avg_lat_rad) / 360.0
@@ -359,26 +348,19 @@ if uploaded_file is not None:
         track_h_m = lat_range * m_per_deg_lat
         max_track_dim = max(track_w_m, track_h_m) if max(track_w_m, track_h_m) > 0 else 1.0
 
-        # 地図の短辺の「80%」にぴったり収まるように基準となるピクセル倍率を算出
         target_px = min(w_orig, h_orig) * 0.8
         pixels_per_meter = target_px / max_track_dim
 
         for seg in gpx_segments:
             gpx_pixels = []
             for lat, lon, time_obj in seg:
-                # 中心地からの距離をメートルに変換
                 dx_m = (lon - center_lon) * m_per_deg_lon
                 dy_m = -(lat - center_lat) * m_per_deg_lat
-                
-                # メートルからピクセルに変換（スライダーのscaleを掛ける）
                 dx = dx_m * pixels_per_meter * gpx_scale
                 dy = dy_m * pixels_per_meter * gpx_scale
-                
-                # 回転の適用
                 rad = np.radians(gpx_rot)
                 rx = dx * np.cos(rad) - dy * np.sin(rad)
                 ry = dx * np.sin(rad) + dy * np.cos(rad)
-                
                 px = int(w_orig / 2 + rx + gpx_offset_x)
                 py = int(h_orig / 2 + ry + gpx_offset_y)
                 gpx_pixels.append((px, py))
@@ -387,19 +369,13 @@ if uploaded_file is not None:
                 pt1, pt2 = gpx_pixels[i], gpx_pixels[i+1]
                 lat1, lon1, t1 = seg[i]
                 lat2, lon2, t2 = seg[i+1]
-                
-                # ペース(min/km)の計算
                 pace = None
                 if t1 and t2:
                     dist_km = haversine_distance((lat1, lon1), (lat2, lon2))
                     dt_sec = (t2 - t1).total_seconds()
                     if dist_km > 0.002 and dt_sec > 0:
                         pace = (dt_sec / 60.0) / dist_km
-                
                 seg_color = get_color_for_pace(pace)
-                
-                # OpenCVは画面外にはみ出た描画を自動で無視してくれるので、
-                # 複雑なif条件を外してそのまま描画命令を投げる
                 cv2.line(vis, pt1, pt2, (255, 255, 255), thickness=6)
                 cv2.line(vis, pt1, pt2, seg_color, thickness=3)
 
@@ -415,17 +391,27 @@ if uploaded_file is not None:
             cv2.line(vis, pt1, pt2, color, thickness=4)
 
     with col_map:
-        vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        # ★ 完全解決策：高画質のまま1600pxに制限し、use_column_width=Trueを復活
+        # これにより、どんなブラウザサイズでも「画像に対する正確な相対座標」が確実に取れます
+        disp_w = min(w_orig, 1600)
+        disp_h = int(h_orig * (disp_w / w_orig))
+        vis_disp = cv2.resize(vis, (disp_w, disp_h))
+        vis_rgb = cv2.cvtColor(vis_disp, cv2.COLOR_BGR2RGB)
+        
         click_val = streamlit_image_coordinates(vis_rgb, key="main_map", use_column_width=True)
 
         if click_val is not None and click_val != st.session_state.last_click:
             st.session_state.last_click = click_val
-            nx = click_val['x'] / w_orig
-            ny = click_val['y'] / h_orig
+            
+            # コンポーネントから返ってきた座標を、渡した画像の幅(disp_w)で割ることで、完璧な%を取得
+            nx = click_val['x'] / disp_w
+            ny = click_val['y'] / disp_h
+            
             if st.session_state.point_type == "🔵 スタート":
                 st.session_state.start_nx, st.session_state.start_ny = nx, ny
             else:
                 st.session_state.goal_nx, st.session_state.goal_ny = nx, ny
-            st.rerun()
+            
+            st.rerun() 
 else:
     st.info("左のパネルから地図画像をアップロードしてください。")
