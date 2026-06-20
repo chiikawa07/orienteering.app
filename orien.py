@@ -6,16 +6,18 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 import xml.etree.ElementTree as ET
 
 # ==========================================
-# UI: タイトルとページ設定
+# UI: ページ設定とカスタムCSS（Livelox風のフルスクリーン化）
 # ==========================================
-st.set_page_config(layout="wide")
-st.title("オリエンテーリングAI (GPSログ重ね合わせ版)")
+st.set_page_config(layout="wide", page_title="オリエンテーリングAI")
 
-col_file1, col_file2 = st.columns(2)
-with col_file1:
-    uploaded_file = st.file_uploader("1. 地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
-with col_file2:
-    gpx_file = st.file_uploader("2. 【任意】実走GPSログ（.gpx）を選択してください", type=["gpx"])
+# 余白を極限まで削り、アプリらしさを出すためのCSSハック
+st.markdown("""
+    <style>
+    .block-container { padding-top: 1rem; padding-bottom: 1rem; max-width: 98%; }
+    .stExpander { border: 1px solid #444; border-radius: 8px; }
+    hr { margin-top: 0.5rem; margin-bottom: 0.5rem; }
+    </style>
+""", unsafe_allow_html=True)
 
 # 2点間の球面距離(km)を計算するハバーシン公式
 def haversine_distance(p1, p2):
@@ -28,7 +30,7 @@ def haversine_distance(p1, p2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
-# ★修正：GPXデータを「セグメント（線の切れ目）」ごとに分けて取得する
+# GPXデータをセグメントごとに取得する
 def parse_gpx_data(file_bytes):
     try:
         root = ET.fromstring(file_bytes)
@@ -43,7 +45,6 @@ def parse_gpx_data(file_bytes):
                         seg_points.append((lat, lon))
                 if seg_points:
                     segments.append(seg_points)
-        # トラックがない場合はルートやウェイポイントを探す
         if not segments:
             pts = []
             for pt in root.iter():
@@ -61,7 +62,7 @@ def parse_gpx_data(file_bytes):
 # ==========================================
 # 画像処理をキャッシュ化
 # ==========================================
-@st.cache_data(show_spinner="AIが地図の色と地形を解析中...")
+@st.cache_data(show_spinner="AIが地図と地形を解析中...")
 def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     img_array = np.asarray(bytearray(file_bytes), dtype=np.uint8)
     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -141,12 +142,12 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     grad_y = np.where(grad_mag > 0, grad_y / grad_mag, 0.0)
     
     slope_heatmap = cv2.GaussianBlur(mask_brown, (31, 31), 0) 
-    slope_penalty = (slope_heatmap / 255.0) * slope_weight
+    slope_penalty = (slope_heatmap / 255.0) * 20.0 # slope_weight固定
 
     inv_road = cv2.bitwise_not(road_mask)
     dist_to_road = cv2.distanceTransform(inv_road, cv2.DIST_L2, 5)
     dist_capped = np.clip(dist_to_road, 0, 80) 
-    nav_penalty = (dist_capped / 80.0) * nav_weight
+    nav_penalty = (dist_capped / 80.0) * 3.0 # nav_weight固定
 
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
@@ -167,10 +168,60 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
 
     return small_img, h_s, w_s, road_mask, attack_points, grad_x, grad_y, grad_mag, dist_capped, small_cost
 
+def dijkstra(cost_map, gx_mat, gy_mat, g_mag, start, goal):
+    h, w = cost_map.shape
+    dist = np.full((h, w), np.inf)
+    prev = np.full((h, w, 2), -1)
+    dist[start] = 0
+    pq = [(0, start)]
+    directions = [(-1,0),(1,0),(0,-1),(0,1), (-1,-1),(-1,1),(1,-1),(1,1)]
+    c_weight = 50.0
+
+    while pq:
+        d, (y,x) = heapq.heappop(pq)
+        if (y,x) == goal: break
+        for dy, dx in directions:
+            ny, nx = y+dy, x+dx
+            if 0 <= ny < h and 0 <= nx < w:
+                if cost_map[ny,nx] >= 9999: continue
+                move_weight = 1.414 if (dy != 0 and dx != 0) else 1.0
+                base_step_cost = cost_map[ny,nx]
+                if g_mag[ny, nx] > 10:
+                    move_len = np.sqrt(dy**2 + dx**2)
+                    mdy, mdx = dy / move_len, dx / move_len
+                    dot_product = abs(mdy * gy_mat[ny, nx] + mdx * gx_mat[ny, nx])
+                    base_step_cost += dot_product * c_weight
+
+                nd = d + (base_step_cost * move_weight)
+                if nd < dist[ny,nx]:
+                    dist[ny,nx] = nd
+                    prev[ny,nx] = [y,x]
+                    heapq.heappush(pq, (nd, (ny,nx)))
+
+    path = []
+    cur = goal
+    while tuple(cur) != tuple(start):
+        path.append(cur)
+        cur = prev[cur[0], cur[1]]
+        if cur[0] == -1: break
+    path.append(start)
+    return path[::-1]
+
 # ==========================================
-# メイン処理開始
+# メインUI： Livelox風カラムレイアウト [左パネル 1 : 右マップ 3]
 # ==========================================
+col_panel, col_map = st.columns([1, 3])
+
+with col_panel:
+    st.markdown("### 🧭 Livelox風 解析AI")
+    
+    # ファイルアップローダーをExpander（折りたたみ）に収納してスッキリさせる
+    with st.expander("📂 地図とGPSの読み込み", expanded=True):
+        uploaded_file = st.file_uploader("地図画像 (必須)", type=["png", "jpg", "jpeg"])
+        gpx_file = st.file_uploader("GPSログ (.gpx)", type=["gpx"])
+
 if uploaded_file is not None:
+    # --- データ処理 ---
     gpx_segments = []
     total_gpx_dist = 0.0
     total_pts = 0
@@ -181,72 +232,9 @@ if uploaded_file is not None:
             for i in range(len(seg) - 1):
                 total_gpx_dist += haversine_distance(seg[i], seg[i+1])
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("⛰️ アップダウン・沢またぎの回避設定")
-    slope_weight = st.sidebar.slider("斜度の基本ペナルティ (全体の回避度)", 0.0, 50.0, 20.0, step=2.0)
-    cross_weight = st.sidebar.slider("等高線を横切る移動へのペナルティ", 0.0, 100.0, 50.0, step=5.0)
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🧭 ナビゲーション難易度の設定")
-    nav_weight = st.sidebar.slider("道から離れることへの不安度", 0.0, 10.0, 3.0, step=0.5)
-
-    gpx_scale, gpx_rot, gpx_offset_x, gpx_offset_y = 1.0, 0, 0, 0
-    if gpx_segments:
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🏃‍♂️ GPSログの位置同期（位置合わせ）")
-        st.sidebar.write("地図上の道と軌跡が重なるように調整してください。")
-        gpx_scale = st.sidebar.slider("GPS軌跡の拡大率", 0.1, 5.0, 1.0, step=0.05)
-        gpx_rot = st.sidebar.slider("GPS軌跡の回転角度", -180, 180, 0, step=1)
-        gpx_offset_x = st.sidebar.slider("左右移動 (X)", -5000, 5000, 0, step=10)
-        gpx_offset_y = st.sidebar.slider("上下移動 (Y)", -5000, 5000, 0, step=10)
-
     scale = 0.35
     file_bytes = bytes(uploaded_file.read())
-    (small_img, h_s, w_s, road_mask, attack_points, grad_x, grad_y, grad_mag, dist_capped, small_cost) = process_map_data(file_bytes, scale, slope_weight, nav_weight)
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("AIの脳内マップ")
-    display_cost = np.clip(small_cost, 0, 10)
-    cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    st.sidebar.image(cost_visual, use_container_width=True)
-
-    def dijkstra(cost_map, gx_mat, gy_mat, g_mag, c_weight, start, goal):
-        h, w = cost_map.shape
-        dist = np.full((h, w), np.inf)
-        prev = np.full((h, w, 2), -1)
-        dist[start] = 0
-        pq = [(0, start)]
-        directions = [(-1,0),(1,0),(0,-1),(0,1), (-1,-1),(-1,1),(1,-1),(1,1)]
-
-        while pq:
-            d, (y,x) = heapq.heappop(pq)
-            if (y,x) == goal: break
-            for dy, dx in directions:
-                ny, nx = y+dy, x+dx
-                if 0 <= ny < h and 0 <= nx < w:
-                    if cost_map[ny,nx] >= 9999: continue
-                    move_weight = 1.414 if (dy != 0 and dx != 0) else 1.0
-                    base_step_cost = cost_map[ny,nx]
-                    if g_mag[ny, nx] > 10:
-                        move_len = np.sqrt(dy**2 + dx**2)
-                        mdy, mdx = dy / move_len, dx / move_len
-                        dot_product = abs(mdy * gy_mat[ny, nx] + mdx * gx_mat[ny, nx])
-                        base_step_cost += dot_product * c_weight
-
-                    nd = d + (base_step_cost * move_weight)
-                    if nd < dist[ny,nx]:
-                        dist[ny,nx] = nd
-                        prev[ny,nx] = [y,x]
-                        heapq.heappush(pq, (nd, (ny,nx)))
-
-        path = []
-        cur = goal
-        while tuple(cur) != tuple(start):
-            path.append(cur)
-            cur = prev[cur[0], cur[1]]
-            if cur[0] == -1: break
-        path.append(start)
-        return path[::-1]
+    (small_img, h_s, w_s, road_mask, attack_points, grad_x, grad_y, grad_mag, dist_capped, small_cost) = process_map_data(file_bytes, scale, 20.0, 3.0)
 
     if 'start_nx' not in st.session_state:
         st.session_state.start_nx, st.session_state.start_ny = 0.53, 0.77
@@ -254,161 +242,136 @@ if uploaded_file is not None:
     if 'last_click' not in st.session_state:
         st.session_state.last_click = None
 
-    st.markdown("---")
-    st.subheader("📍 1. ルートを設定する (地図をクリック)")
-    point_type = st.radio("クリックで動かすポイントを選択:", ["🔵 スタート", "🔴 ゴール"], horizontal=True)
-    
-    ui_width = 800
-    ui_height = int(h_s * (ui_width / w_s))
-
-    click_map_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
-    click_map_ui = cv2.resize(click_map_img, (ui_width, ui_height))
-    
-    ui_sx, ui_sy = int(st.session_state.start_nx * ui_width), int(st.session_state.start_ny * ui_height)
-    ui_gx, ui_gy = int(st.session_state.goal_nx * ui_width), int(st.session_state.goal_ny * ui_height)
-
-    cv2.circle(click_map_ui, (ui_sx, ui_sy), 8, (255, 0, 255), -1)
-    cv2.putText(click_map_ui, "S", (ui_sx + 10, ui_sy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
-    cv2.circle(click_map_ui, (ui_gx, ui_gy), 8, (255, 0, 255), 2)
-    cv2.circle(click_map_ui, (ui_gx, ui_gy), 3, (255, 0, 255), -1)
-    cv2.putText(click_map_ui, "G", (ui_gx + 10, ui_gy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
-    
-    click_val = streamlit_image_coordinates(click_map_ui, key="map_click")
-
-    if click_val is not None and click_val != st.session_state.last_click:
-        st.session_state.last_click = click_val
-        nx, ny = click_val['x'] / ui_width, click_val['y'] / ui_height
-        if point_type == "🔵 スタート":
-            st.session_state.start_nx, st.session_state.start_ny = nx, ny
-        else:
-            st.session_state.goal_nx, st.session_state.goal_ny = nx, ny
-        st.rerun()
-
     margin = 20
     sx = max(margin, min(int(st.session_state.start_nx * w_s), w_s - margin - 1))
     sy = max(margin, min(int(st.session_state.start_ny * h_s), h_s - margin - 1))
     gx = max(margin, min(int(st.session_state.goal_nx * w_s), w_s - margin - 1))
     gy = max(margin, min(int(st.session_state.goal_ny * h_s), h_s - margin - 1))
-
     start, goal = (sy, sx), (gy, gx)
 
-    st.markdown("---")
-    st.subheader("🗺️ 2. AIルート解析結果")
+    # --- ルート探索 ---
+    routes, metrics = [], []
+    colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)] # 赤, 青, 緑
+    
+    if small_cost[start] < 9999 and small_cost[goal] < 9999:
+        path1 = dijkstra(small_cost, grad_x, grad_y, grad_mag, start, goal)
+        if path1 and len(path1) > 1:
+            routes.append(path1)
+            metrics.append({"名前": "AI 最適解", "色": "🔴 赤", "スコア": round(sum(small_cost[p[0], p[1]] for p in path1), 1)})
 
-    if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
-        st.error("⚠️ 通行不可エリアです。別の場所をクリックしてください。")
-    else:
-        with st.spinner('AIがルートを探索中...'):
-            routes, metrics = [], []
-            colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)]
+        best_ap = min(attack_points, key=lambda p: np.hypot(p[0]-goal[0], p[1]-goal[1])) if attack_points else None
+        if best_ap:
+            path_to_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, start, best_ap)
+            path_from_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, best_ap, goal)
+            if path_to_ap and path_from_ap:
+                path2 = path_to_ap[:-1] + path_from_ap
+                routes.append(path2)
+                metrics.append({"名前": "AP 経由", "色": "🔵 青", "スコア": round(sum(small_cost[p[0], p[1]] for p in path2), 1)})
+
+        if path1:
+            search_cost = small_cost.copy()
+            for p in path1:
+                y_min, y_max = max(0, p[0]-4), min(h_s, p[0]+5)
+                x_min, x_max = max(0, p[1]-4), min(w_s, p[1]+5)
+                search_cost[y_min:y_max, x_min:x_max] += 25.0
+            path3 = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, goal)
+            if path3 and len(path3) > 1:
+                routes.append(path3)
+                metrics.append({"名前": "大穴ルート", "色": "🟢 緑", "スコア": round(sum(small_cost[p[0], p[1]] for p in path3), 1)})
+
+    # --- 地図画像の生成（ベース） ---
+    vis = cv2.imdecode(np.asarray(bytearray(file_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
+    h_orig, w_orig = vis.shape[:2]
+    scale_inv = 1 / scale
+
+    orig_start = (int(st.session_state.start_nx * w_orig), int(st.session_state.start_ny * h_orig))
+    orig_goal = (int(st.session_state.goal_nx * w_orig), int(st.session_state.goal_ny * h_orig))
+
+    for ap in attack_points:
+        cv2.circle(vis, (int(ap[1] * scale_inv), int(ap[0] * scale_inv)), 4, (0, 255, 255), -1)
+    if best_ap:
+        cv2.circle(vis, (int(best_ap[1] * scale_inv), int(best_ap[0] * scale_inv)), 15, (255, 255, 0), 4)
+
+    # --- 左パネル：Livelox風 リーダーボード＆設定 ---
+    with col_panel:
+        st.radio("📌 地図をクリックして移動:", ["🔵 スタート", "🔴 ゴール"], key="point_type")
+        
+        st.markdown("### 🏃‍♂️ 競技者 (ルート比較)")
+        # 算出したルートをLiveloxの左メニューのようにリスト表示
+        for m in metrics:
+            st.markdown(f"**{m['色']} : {m['名前']}**<br>難易度スコア: {m['スコア']}", unsafe_allow_html=True)
+            st.markdown("<hr>", unsafe_allow_html=True)
+        
+        if gpx_segments:
+            st.markdown(f"**🟠 オレンジ : あなたの実走**<br>距離: {round(total_gpx_dist, 2)} km", unsafe_allow_html=True)
+            st.markdown("<hr>", unsafe_allow_html=True)
             
-            path1 = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, start, goal)
-            if path1 and len(path1) > 1:
-                routes.append(path1)
-                metrics.append({"名前": "第1ルート (AI最適解)", "色": "🔴 赤", "難易度スコア": round(sum(small_cost[p[0], p[1]] for p in path1), 1), "距離": len(path1)})
-
-            best_ap = min(attack_points, key=lambda p: np.hypot(p[0]-goal[0], p[1]-goal[1])) if attack_points else None
-            if best_ap:
-                path_to_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, start, best_ap)
-                path_from_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, best_ap, goal)
-                if path_to_ap and path_from_ap:
-                    path2 = path_to_ap[:-1] + path_from_ap
-                    routes.append(path2)
-                    metrics.append({"名前": "第2ルート (AP経由)", "色": "🔵 青", "難易度スコア": round(sum(small_cost[p[0], p[1]] for p in path2), 1), "距離": len(path2)})
-
-            if path1:
-                search_cost = small_cost.copy()
-                for p in path1:
-                    y_min, y_max = max(0, p[0]-4), min(h_s, p[0]+5)
-                    x_min, x_max = max(0, p[1]-4), min(w_s, p[1]+5)
-                    search_cost[y_min:y_max, x_min:x_max] += 25.0
-                path3 = dijkstra(search_cost, grad_x, grad_y, grad_mag, cross_weight, start, goal)
-                if path3 and len(path3) > 1:
-                    routes.append(path3)
-                    metrics.append({"名前": "第3ルート (迂回大穴)", "色": "🟢 緑", "難易度スコア": round(sum(small_cost[p[0], p[1]] for p in path3), 1), "距離": len(path3)})
-
-        if not routes:
-            st.warning("⚠️ ルートが見つかりませんでした。")
+            with st.expander("⚙️ GPS位置合わせ", expanded=True):
+                gpx_scale = st.slider("拡大率", 0.1, 5.0, 1.0, step=0.05)
+                gpx_rot = st.slider("回転角度", -180, 180, 0, step=1)
+                gpx_offset_x = st.slider("左右移動 (X)", -5000, 5000, 0, step=10)
+                gpx_offset_y = st.slider("上下移動 (Y)", -5000, 5000, 0, step=10)
         else:
-            vis = cv2.imdecode(np.asarray(bytearray(file_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
-            h_orig, w_orig = vis.shape[:2]
+            gpx_scale, gpx_rot, gpx_offset_x, gpx_offset_y = 1.0, 0, 0, 0
 
-            orig_start = (int(st.session_state.start_nx * w_orig), int(st.session_state.start_ny * h_orig))
-            orig_goal = (int(st.session_state.goal_nx * w_orig), int(st.session_state.goal_ny * h_orig))
+    # --- GPSの描画 ---
+    if gpx_segments:
+        all_lats = [p[0] for seg in gpx_segments for p in seg]
+        all_lons = [p[1] for seg in gpx_segments for p in seg]
+        center_lat, center_lon = (min(all_lats) + max(all_lats)) / 2, (min(all_lons) + max(all_lons)) / 2
+        lat_range = max(all_lats) - min(all_lats) if max(all_lats) != min(all_lats) else 1e-6
+        lon_range = max(all_lons) - min(all_lons) if max(all_lons) != min(all_lons) else 1e-6
+        base_scale = min(w_orig, h_orig)
 
-            scale_inv = 1 / scale
-            for ap in attack_points:
-                cv2.circle(vis, (int(ap[1] * scale_inv), int(ap[0] * scale_inv)), 4, (0, 255, 255), -1)
-            if best_ap:
-                cv2.circle(vis, (int(best_ap[1] * scale_inv), int(best_ap[0] * scale_inv)), 15, (255, 255, 0), 4)
-
-            # ★修正：GPSデータの正規化とスマートな描画
-            if gpx_segments:
-                all_lats = [p[0] for seg in gpx_segments for p in seg]
-                all_lons = [p[1] for seg in gpx_segments for p in seg]
-                min_lat, max_lat = min(all_lats), max(all_lats)
-                min_lon, max_lon = min(all_lons), max(all_lons)
-                center_lat = (min_lat + max_lat) / 2
-                center_lon = (min_lon + max_lon) / 2
-                lat_range = max_lat - min_lat if max_lat != min_lat else 1e-6
-                lon_range = max_lon - min_lon if max_lon != min_lon else 1e-6
-
-                base_scale = min(w_orig, h_orig)
-
-                for seg in gpx_segments:
-                    gpx_pixels = []
-                    for lat, lon in seg:
-                        nx = (lon - center_lon) / lon_range
-                        ny = -(lat - center_lat) / lat_range
-                        
-                        dx = nx * base_scale * gpx_scale
-                        dy = ny * base_scale * gpx_scale
-                        
-                        rad = np.radians(gpx_rot)
-                        rx = dx * np.cos(rad) - dy * np.sin(rad)
-                        ry = dx * np.sin(rad) + dy * np.cos(rad)
-                        
-                        px = int(w_orig / 2 + rx + gpx_offset_x)
-                        py = int(h_orig / 2 + ry + gpx_offset_y)
-                        gpx_pixels.append((px, py))
-                    
-                    for i in range(len(gpx_pixels) - 1):
-                        pt1, pt2 = gpx_pixels[i], gpx_pixels[i+1]
-                        if (0 <= pt1[0] < w_orig and 0 <= pt1[1] < h_orig and 0 <= pt2[0] < w_orig and 0 <= pt2[1] < h_orig):
-                            cv2.line(vis, pt1, pt2, (0, 100, 255), thickness=6)
-                            cv2.line(vis, pt1, pt2, (0, 180, 255), thickness=3)
-
-            cv2.circle(vis, orig_start, 30, (255, 0, 255), 5)
-            cv2.circle(vis, orig_goal, 30, (255, 0, 255), 5)
-            cv2.circle(vis, orig_goal, 18, (255, 0, 255), 3)
-
-            for i in reversed(range(len(routes))):
-                color = colors[i]
-                for j in range(len(routes[i]) - 1):
-                    pt1 = (int(routes[i][j][1] * scale_inv), int(routes[i][j][0] * scale_inv))
-                    pt2 = (int(routes[i][j+1][1] * scale_inv), int(routes[i][j+1][0] * scale_inv))
-                    cv2.line(vis, pt1, pt2, color, thickness=4)
-
-            st.image(vis, channels="BGR", caption="赤:最適解 / 青:AP経由 / 緑:大穴 / オレンジ:あなたのGPS実走ログ", use_container_width=True)
+        for seg in gpx_segments:
+            gpx_pixels = []
+            for lat, lon in seg:
+                nx = (lon - center_lon) / lon_range
+                ny = -(lat - center_lat) / lat_range
+                dx, dy = nx * base_scale * gpx_scale, ny * base_scale * gpx_scale
+                rad = np.radians(gpx_rot)
+                rx = dx * np.cos(rad) - dy * np.sin(rad)
+                ry = dx * np.sin(rad) + dy * np.cos(rad)
+                gpx_pixels.append((int(w_orig / 2 + rx + gpx_offset_x), int(h_orig / 2 + ry + gpx_offset_y)))
             
-            st.subheader("📊 ルートごとのパフォーマンス比較")
-            
-            num_cols = len(metrics) + (1 if gpx_segments else 0)
-            cols = st.columns(num_cols)
-            
-            for i, col in enumerate(cols[:len(metrics)]):
-                with col:
-                    # ★修正：'color' を '色' に戻しました
-                    st.markdown(f"**{metrics[i]['色']} : {metrics[i]['名前']}**")
-                    st.metric(label="難易度スコア (推定タイム)", value=metrics[i]["難易度スコア"])
-                    st.metric(label="移動距離 (ピクセル)", value=metrics[i]["距離"])
-            
-            if gpx_segments:
-                with cols[-1]:
-                    st.markdown("**🏃‍♂️ オレンジ : あなたのGPS実走**")
-                    st.metric(label="実走行距離", value=f"{round(total_gpx_dist, 2)} km")
-                    st.metric(label="ログのデータ点数", value=f"{total_pts} pt")
-                    st.caption("※サイドバーを使って、軌跡を地図の道に重ね合わせてください。")
+            for i in range(len(gpx_pixels) - 1):
+                pt1, pt2 = gpx_pixels[i], gpx_pixels[i+1]
+                if (0 <= pt1[0] < w_orig and 0 <= pt1[1] < h_orig and 0 <= pt2[0] < w_orig and 0 <= pt2[1] < h_orig):
+                    cv2.line(vis, pt1, pt2, (0, 100, 255), thickness=6)
+                    cv2.line(vis, pt1, pt2, (0, 180, 255), thickness=3)
 
+    # --- AIルートとコントロール円の描画 ---
+    cv2.circle(vis, orig_start, 30, (255, 0, 255), 5)
+    cv2.circle(vis, orig_goal, 30, (255, 0, 255), 5)
+    cv2.circle(vis, orig_goal, 18, (255, 0, 255), 3)
+
+    for i in reversed(range(len(routes))):
+        color = colors[i]
+        for j in range(len(routes[i]) - 1):
+            pt1 = (int(routes[i][j][1] * scale_inv), int(routes[i][j][0] * scale_inv))
+            pt2 = (int(routes[i][j+1][1] * scale_inv), int(routes[i][j+1][0] * scale_inv))
+            cv2.line(vis, pt1, pt2, color, thickness=4)
+
+    # --- 右パネル：インタラクティブな巨大マップ ---
+    with col_map:
+        # BGRからRGBに変換して、クリックコンポーネントに巨大マップをそのまま渡す
+        vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        
+        # 画面幅いっぱいに表示し、クリックされた座標を取得
+        click_val = streamlit_image_coordinates(vis_rgb, key="main_map", use_column_width=True)
+
+        if click_val is not None and click_val != st.session_state.last_click:
+            st.session_state.last_click = click_val
+            
+            # クリック座標は原寸大(w_orig, h_orig)の座標で返ってくるため、割合(0.0~1.0)に逆算
+            nx = click_val['x'] / w_orig
+            ny = click_val['y'] / h_orig
+            
+            if st.session_state.point_type == "🔵 スタート":
+                st.session_state.start_nx, st.session_state.start_ny = nx, ny
+            else:
+                st.session_state.goal_nx, st.session_state.goal_ny = nx, ny
+            
+            st.rerun() # クリックされたら即座に再計算
 else:
-    st.info("上のボックスから地図画像をアップロードすると自動的に解析が始まります。")
+    st.info("左のパネルから地図画像をアップロードしてください。")
