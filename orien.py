@@ -4,13 +4,13 @@ import heapq
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 # ==========================================
-# UI: ページ設定とカスタムCSS（Livelox風のフルスクリーン化）
+# UI: ページ設定とカスタムCSS（Livelox風フルスクリーン化）
 # ==========================================
 st.set_page_config(layout="wide", page_title="オリエンテーリングAI")
 
-# 余白を極限まで削り、アプリらしさを出すためのCSSハック
 st.markdown("""
     <style>
     .block-container { padding-top: 1rem; padding-bottom: 1rem; max-width: 98%; }
@@ -19,7 +19,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 2点間の球面距離(km)を計算するハバーシン公式
+# 2点間の球面距離(km)を計算
 def haversine_distance(p1, p2):
     R = 6371.0
     lat1, lon1 = np.radians(p1[0]), np.radians(p1[1])
@@ -30,7 +30,14 @@ def haversine_distance(p1, p2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
-# GPXデータをセグメントごとに取得する
+# GPXの時間文字列をパースするヘルパー関数
+def parse_time(time_str):
+    if not time_str: return None
+    time_str = time_str.replace('Z', '+00:00')
+    try: return datetime.fromisoformat(time_str)
+    except: return None
+
+# GPXデータをセグメントごとに取得（緯度, 経度, 時間）
 def parse_gpx_data(file_bytes):
     try:
         root = ET.fromstring(file_bytes)
@@ -42,7 +49,13 @@ def parse_gpx_data(file_bytes):
                     if pt.tag.endswith('trkpt'):
                         lat = float(pt.attrib['lat'])
                         lon = float(pt.attrib['lon'])
-                        seg_points.append((lat, lon))
+                        time_str = None
+                        for child in pt:
+                            if child.tag.endswith('time'):
+                                time_str = child.text
+                                break
+                        time_obj = parse_time(time_str)
+                        seg_points.append((lat, lon, time_obj))
                 if seg_points:
                     segments.append(seg_points)
         if not segments:
@@ -51,13 +64,29 @@ def parse_gpx_data(file_bytes):
                 if pt.tag.endswith('rtept') or pt.tag.endswith('wpt'):
                     lat = float(pt.attrib['lat'])
                     lon = float(pt.attrib['lon'])
-                    pts.append((lat, lon))
+                    pts.append((lat, lon, None))
             if pts:
                 segments.append(pts)
         return segments
     except Exception as e:
         st.error(f"GPXファイルの解析に失敗しました: {e}")
         return []
+
+# ペース(min/km)から色(BGR)を生成する関数
+def get_color_for_pace(pace):
+    if pace is None:
+        return (0, 180, 255) # 時間データがない場合はオレンジ
+    
+    fast_pace = 4.0   # 4 min/km (緑)
+    slow_pace = 15.0  # 15 min/km (赤 - 歩き・登り・停止)
+    
+    ratio = (pace - fast_pace) / (slow_pace - fast_pace)
+    ratio = max(0.0, min(1.0, ratio)) # 0〜1の間に収める
+    
+    # 緑(速) -> 黄 -> 赤(遅) のグラデーション
+    g = int(255 * (1 - ratio))
+    r = int(255 * ratio)
+    return (0, g, r) # B, G, R
 
 # ==========================================
 # 画像処理をキャッシュ化
@@ -142,12 +171,12 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     grad_y = np.where(grad_mag > 0, grad_y / grad_mag, 0.0)
     
     slope_heatmap = cv2.GaussianBlur(mask_brown, (31, 31), 0) 
-    slope_penalty = (slope_heatmap / 255.0) * 20.0 # slope_weight固定
+    slope_penalty = (slope_heatmap / 255.0) * 20.0
 
     inv_road = cv2.bitwise_not(road_mask)
     dist_to_road = cv2.distanceTransform(inv_road, cv2.DIST_L2, 5)
     dist_capped = np.clip(dist_to_road, 0, 80) 
-    nav_penalty = (dist_capped / 80.0) * 3.0 # nav_weight固定
+    nav_penalty = (dist_capped / 80.0) * 3.0
 
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
@@ -208,20 +237,18 @@ def dijkstra(cost_map, gx_mat, gy_mat, g_mag, start, goal):
     return path[::-1]
 
 # ==========================================
-# メインUI： Livelox風カラムレイアウト [左パネル 1 : 右マップ 3]
+# メインUI： Livelox風カラムレイアウト
 # ==========================================
 col_panel, col_map = st.columns([1, 3])
 
 with col_panel:
     st.markdown("### 🧭 Livelox風 解析AI")
     
-    # ファイルアップローダーをExpander（折りたたみ）に収納してスッキリさせる
     with st.expander("📂 地図とGPSの読み込み", expanded=True):
         uploaded_file = st.file_uploader("地図画像 (必須)", type=["png", "jpg", "jpeg"])
         gpx_file = st.file_uploader("GPSログ (.gpx)", type=["gpx"])
 
 if uploaded_file is not None:
-    # --- データ処理 ---
     gpx_segments = []
     total_gpx_dist = 0.0
     total_pts = 0
@@ -230,7 +257,7 @@ if uploaded_file is not None:
         for seg in gpx_segments:
             total_pts += len(seg)
             for i in range(len(seg) - 1):
-                total_gpx_dist += haversine_distance(seg[i], seg[i+1])
+                total_gpx_dist += haversine_distance((seg[i][0], seg[i][1]), (seg[i+1][0], seg[i+1][1]))
 
     scale = 0.35
     file_bytes = bytes(uploaded_file.read())
@@ -249,9 +276,8 @@ if uploaded_file is not None:
     gy = max(margin, min(int(st.session_state.goal_ny * h_s), h_s - margin - 1))
     start, goal = (sy, sx), (gy, gx)
 
-    # --- ルート探索 ---
     routes, metrics = [], []
-    colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)] # 赤, 青, 緑
+    colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)]
     
     if small_cost[start] < 9999 and small_cost[goal] < 9999:
         path1 = dijkstra(small_cost, grad_x, grad_y, grad_mag, start, goal)
@@ -279,7 +305,6 @@ if uploaded_file is not None:
                 routes.append(path3)
                 metrics.append({"名前": "大穴ルート", "色": "🟢 緑", "スコア": round(sum(small_cost[p[0], p[1]] for p in path3), 1)})
 
-    # --- 地図画像の生成（ベース） ---
     vis = cv2.imdecode(np.asarray(bytearray(file_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
     h_orig, w_orig = vis.shape[:2]
     scale_inv = 1 / scale
@@ -292,18 +317,16 @@ if uploaded_file is not None:
     if best_ap:
         cv2.circle(vis, (int(best_ap[1] * scale_inv), int(best_ap[0] * scale_inv)), 15, (255, 255, 0), 4)
 
-    # --- 左パネル：Livelox風 リーダーボード＆設定 ---
     with col_panel:
         st.radio("📌 地図をクリックして移動:", ["🔵 スタート", "🔴 ゴール"], key="point_type")
         
         st.markdown("### 🏃‍♂️ 競技者 (ルート比較)")
-        # 算出したルートをLiveloxの左メニューのようにリスト表示
         for m in metrics:
             st.markdown(f"**{m['色']} : {m['名前']}**<br>難易度スコア: {m['スコア']}", unsafe_allow_html=True)
             st.markdown("<hr>", unsafe_allow_html=True)
         
         if gpx_segments:
-            st.markdown(f"**🟠 オレンジ : あなたの実走**<br>距離: {round(total_gpx_dist, 2)} km", unsafe_allow_html=True)
+            st.markdown(f"**🏃‍♂️ あなたの実走 (速度色分け)**<br>距離: {round(total_gpx_dist, 2)} km", unsafe_allow_html=True)
             st.markdown("<hr>", unsafe_allow_html=True)
             
             with st.expander("⚙️ GPS位置合わせ", expanded=True):
@@ -314,7 +337,9 @@ if uploaded_file is not None:
         else:
             gpx_scale, gpx_rot, gpx_offset_x, gpx_offset_y = 1.0, 0, 0, 0
 
-    # --- GPSの描画 ---
+    # ==========================================
+    # ★ GPS軌跡のスピード別・色分け描画
+    # ==========================================
     if gpx_segments:
         all_lats = [p[0] for seg in gpx_segments for p in seg]
         all_lons = [p[1] for seg in gpx_segments for p in seg]
@@ -325,7 +350,7 @@ if uploaded_file is not None:
 
         for seg in gpx_segments:
             gpx_pixels = []
-            for lat, lon in seg:
+            for lat, lon, time_obj in seg:
                 nx = (lon - center_lon) / lon_range
                 ny = -(lat - center_lat) / lat_range
                 dx, dy = nx * base_scale * gpx_scale, ny * base_scale * gpx_scale
@@ -336,11 +361,25 @@ if uploaded_file is not None:
             
             for i in range(len(gpx_pixels) - 1):
                 pt1, pt2 = gpx_pixels[i], gpx_pixels[i+1]
+                lat1, lon1, t1 = seg[i]
+                lat2, lon2, t2 = seg[i+1]
+                
+                # ペース(min/km)の計算
+                pace = None
+                if t1 and t2:
+                    dist_km = haversine_distance((lat1, lon1), (lat2, lon2))
+                    dt_sec = (t2 - t1).total_seconds()
+                    if dist_km > 0.002 and dt_sec > 0: # 誤差を除外
+                        pace = (dt_sec / 60.0) / dist_km
+                
+                # 速度に応じた色を取得
+                seg_color = get_color_for_pace(pace)
+                
                 if (0 <= pt1[0] < w_orig and 0 <= pt1[1] < h_orig and 0 <= pt2[0] < w_orig and 0 <= pt2[1] < h_orig):
-                    cv2.line(vis, pt1, pt2, (0, 100, 255), thickness=6)
-                    cv2.line(vis, pt1, pt2, (0, 180, 255), thickness=3)
+                    # 白いフチドリを描いてから、中にスピード色を描画
+                    cv2.line(vis, pt1, pt2, (255, 255, 255), thickness=6)
+                    cv2.line(vis, pt1, pt2, seg_color, thickness=3)
 
-    # --- AIルートとコントロール円の描画 ---
     cv2.circle(vis, orig_start, 30, (255, 0, 255), 5)
     cv2.circle(vis, orig_goal, 30, (255, 0, 255), 5)
     cv2.circle(vis, orig_goal, 18, (255, 0, 255), 3)
@@ -352,26 +391,18 @@ if uploaded_file is not None:
             pt2 = (int(routes[i][j+1][1] * scale_inv), int(routes[i][j+1][0] * scale_inv))
             cv2.line(vis, pt1, pt2, color, thickness=4)
 
-    # --- 右パネル：インタラクティブな巨大マップ ---
     with col_map:
-        # BGRからRGBに変換して、クリックコンポーネントに巨大マップをそのまま渡す
         vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-        
-        # 画面幅いっぱいに表示し、クリックされた座標を取得
         click_val = streamlit_image_coordinates(vis_rgb, key="main_map", use_column_width=True)
 
         if click_val is not None and click_val != st.session_state.last_click:
             st.session_state.last_click = click_val
-            
-            # クリック座標は原寸大(w_orig, h_orig)の座標で返ってくるため、割合(0.0~1.0)に逆算
             nx = click_val['x'] / w_orig
             ny = click_val['y'] / h_orig
-            
             if st.session_state.point_type == "🔵 スタート":
                 st.session_state.start_nx, st.session_state.start_ny = nx, ny
             else:
                 st.session_state.goal_nx, st.session_state.goal_ny = nx, ny
-            
-            st.rerun() # クリックされたら即座に再計算
+            st.rerun()
 else:
     st.info("左のパネルから地図画像をアップロードしてください。")
