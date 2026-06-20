@@ -6,7 +6,7 @@ import streamlit as st
 # ==========================================
 # UI: タイトルとアップローダー
 # ==========================================
-st.title("オリエンテーリングAI (ナビゲーション考慮版)")
+st.title("オリエンテーリングAI (アタックポイント抽出版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -66,7 +66,7 @@ if uploaded_file is not None:
         mask_blue = masks["blue"]
 
     # =========================
-    # ③〜④ 小径（点線）と建物（壁）の判別
+    # ③〜④ 小径（点線）の結合と、建物の判別
     # =========================
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask_black_closed = cv2.morphologyEx(mask_black, cv2.MORPH_CLOSE, kernel_close)
@@ -90,7 +90,18 @@ if uploaded_file is not None:
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
     # =========================
-    # ⑤ 地形コスト設定 & 勾配ベクトル & 【新規】ナビゲーションペナルティ
+    # ⑤ 【NEW】アタックポイント（特徴点）の自動抽出
+    # =========================
+    # 道の交差点や鋭いカーブを「Shi-Tomasiコーナー検出」で抽出する
+    corners = cv2.goodFeaturesToTrack(road_mask, maxCorners=50, qualityLevel=0.1, minDistance=20)
+    attack_points = []
+    if corners is not None:
+        for i in corners:
+            cx, cy = i.ravel()
+            attack_points.append((int(cy), int(cx)))
+
+    # =========================
+    # ⑥ 地形コスト設定 & 勾配ベクトル & ナビゲーションペナルティ
     # =========================
     st.sidebar.markdown("---")
     st.sidebar.subheader("⛰️ アップダウン・沢またぎの回避設定")
@@ -99,10 +110,8 @@ if uploaded_file is not None:
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧭 ナビゲーション難易度の設定")
-    st.sidebar.write("数値を上げると、現在地を見失わないよう道や小径（ハンドレール）の近くを好んで走るようになります。")
     nav_weight = st.sidebar.slider("道から離れることへの不安度 (ペナルティ)", 0.0, 10.0, 3.0, step=0.5)
 
-    # (A) 勾配と密集度ペナルティの計算
     brown_blur = cv2.GaussianBlur(mask_brown, (5, 5), 0)
     grad_x = cv2.Sobel(brown_blur, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(brown_blur, cv2.CV_32F, 0, 1, ksize=3)
@@ -112,15 +121,11 @@ if uploaded_file is not None:
     slope_heatmap = cv2.GaussianBlur(mask_brown, (21, 21), 0)
     slope_penalty = (slope_heatmap / 255.0) * slope_weight
 
-    # (B) 【新規】ナビゲーションペナルティの計算（距離変換）
-    # 道マスクを反転（道=0, それ以外=255）させて距離を測る
     inv_road = cv2.bitwise_not(road_mask)
     dist_to_road = cv2.distanceTransform(inv_road, cv2.DIST_L2, 5)
-    # 最大50ピクセル離れたところで不安度はピーク（頭打ち）とする
     dist_capped = np.clip(dist_to_road, 0, 50)
     nav_penalty = (dist_capped / 50.0) * nav_weight
 
-    # (C) 基本コストマップの合成
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
     small_cost[mask_yellow > 0] = 0.8
@@ -128,10 +133,8 @@ if uploaded_file is not None:
     small_cost[mask_green > 0] = 3.0
     small_cost[road_mask > 0] = 0.5
     
-    # ペナルティをすべて上乗せ！
     small_cost = small_cost + slope_penalty + nav_penalty
 
-    # 絶対障害物の適用（上乗せ後に適用して壁を維持する）
     small_cost[wall_mask > 0] = 9999
     small_cost[mask_blue > 0] = 9999
 
@@ -142,7 +145,7 @@ if uploaded_file is not None:
     small_cost[:, -margin:] = 9999
 
     # =========================
-    # ⑥ デバッグUI表示
+    # ⑦ デバッグUI表示
     # =========================
     st.sidebar.markdown("---")
     st.sidebar.subheader("AIの脳内マップ")
@@ -151,15 +154,18 @@ if uploaded_file is not None:
     st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
 
     with st.sidebar.expander("🔍 AIの空間認識テスト"):
-        # 距離変換マップをカラー化して表示
+        # 抽出したアタックポイントを道マスク上に可視化
+        ap_vis = cv2.cvtColor(road_mask, cv2.COLOR_GRAY2BGR)
+        for ap in attack_points:
+            cv2.circle(ap_vis, (ap[1], ap[0]), 3, (0, 255, 255), -1)
+        st.image(ap_vis, caption="📍 抽出されたアタックポイント候補 (道の分岐・角)", use_container_width=True)
+        
         dist_color = cv2.normalize(dist_capped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         dist_color = cv2.applyColorMap(dist_color, cv2.COLORMAP_JET)
-        st.image(dist_color, caption="🗺️ ナビゲーション不安度 (赤＝道から遠い危険地帯 / 青＝道の近くで安心)", use_container_width=True)
-        st.image(slope_heatmap, caption="🔥 急斜面ヒートマップ", use_container_width=True)
-        st.image(road_mask, caption="黒（道・小径と認識した場所）", use_container_width=True)
+        st.image(dist_color, caption="🗺️ ナビ不安度 (赤＝危険地帯)", use_container_width=True)
 
     # =========================
-    # ⑦ 経路探索（異方性コスト対応ダイクストラ法）
+    # ⑧ 経路探索（異方性コスト対応ダイクストラ法）
     # =========================
     def dijkstra(cost_map, gx_mat, gy_mat, g_mag, c_weight, start, goal):
         h, w = cost_map.shape
@@ -206,7 +212,7 @@ if uploaded_file is not None:
         return path[::-1]
 
     # =========================
-    # ⑧ スライダーと複数ルート探索
+    # ⑨ スライダーと「人間的アタックルート」の探索
     # =========================
     st.sidebar.header("コントロールの設定")
     sy = st.sidebar.slider("スタート Y位置 (%)", 0, 100, 77)
@@ -223,40 +229,66 @@ if uploaded_file is not None:
     if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
         st.error("⚠️ スタートまたはゴールが通行不可エリアです。スライダーをずらしてください。")
     else:
-        with st.spinner('AIが「ナビのしやすさ」と「地形」を総合評価して探索中...'):
+        with st.spinner('AIがアタックポイントを経由する人間的ルートを探索中...'):
             routes = []
             metrics = []
             colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)]
-            route_names = ["第1ルート (最適解)", "第2ルート (別ルート)", "第3ルート (大穴)"]
             
-            search_cost = small_cost.copy()
-            for i in range(3):
-                path = dijkstra(search_cost, grad_x, grad_y, grad_mag, cross_weight, start, goal)
-                if not path or len(path) <= 1:
-                    break
-                    
-                route_dist = len(path)
-                route_diff = sum(small_cost[p[0], p[1]] for p in path)
-                
-                routes.append(path)
+            # 【第1ルート】純粋なAI最適解
+            path1 = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, start, goal)
+            if path1 and len(path1) > 1:
+                routes.append(path1)
                 metrics.append({
-                    "名前": route_names[i],
-                    "色": ["🔴 赤", "🔵 青", "🟢 緑"][i],
-                    "難易度スコア": round(route_diff, 1),
-                    "相対距離": route_dist
+                    "名前": "第1ルート (AI最適解)",
+                    "色": "🔴 赤",
+                    "難易度スコア": round(sum(small_cost[p[0], p[1]] for p in path1), 1),
+                    "距離": len(path1)
                 })
-                
-                for p in path:
+
+            # 【第2ルート】アタックポイント経由（人間的ルート）
+            best_ap = None
+            if attack_points:
+                # ゴールに最も近いアタックポイント（道の分岐）を探す
+                best_ap = min(attack_points, key=lambda p: np.hypot(p[0]-goal[0], p[1]-goal[1]))
+            
+            path2 = []
+            if best_ap:
+                # スタートからAPまで、APからゴールまでの2段階でルートを引く
+                path_to_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, start, best_ap)
+                path_from_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, cross_weight, best_ap, goal)
+                if path_to_ap and path_from_ap:
+                    path2 = path_to_ap[:-1] + path_from_ap
+                    routes.append(path2)
+                    metrics.append({
+                        "名前": "第2ルート (AP経由)",
+                        "色": "🔵 青",
+                        "難易度スコア": round(sum(small_cost[p[0], p[1]] for p in path2), 1),
+                        "距離": len(path2)
+                    })
+
+            # 【第3ルート】大穴ルート（第1ルートを避ける）
+            if path1:
+                search_cost = small_cost.copy()
+                for p in path1:
                     y, x = p
                     y_min, y_max = max(0, y-4), min(h_s, y+5)
                     x_min, x_max = max(0, x-4), min(w_s, x+5)
                     search_cost[y_min:y_max, x_min:x_max] += 25.0
+                path3 = dijkstra(search_cost, grad_x, grad_y, grad_mag, cross_weight, start, goal)
+                if path3 and len(path3) > 1:
+                    routes.append(path3)
+                    metrics.append({
+                        "名前": "第3ルート (迂回大穴)",
+                        "色": "🟢 緑",
+                        "難易度スコア": round(sum(small_cost[p[0], p[1]] for p in path3), 1),
+                        "距離": len(path3)
+                    })
 
         if not routes:
             st.warning("⚠️ ルートが見つかりませんでした。")
         else:
             # =========================
-            # ⑨ 可視化とダッシュボード
+            # ⑩ 可視化とダッシュボード
             # =========================
             vis = img.copy()
             scale_inv = int(1 / scale)
@@ -265,6 +297,15 @@ if uploaded_file is not None:
 
             orig_start = (int(w_orig * sx / 100), int(h_orig * sy / 100))
             orig_goal = (int(w_orig * gx / 100), int(h_orig * gy / 100))
+
+            # 地図上に抽出されたすべてのアタックポイントを小さな黄色い点で描画
+            for ap in attack_points:
+                cv2.circle(vis, (ap[1] * scale_inv, ap[0] * scale_inv), 4, (0, 255, 255), -1)
+
+            # 選ばれた「最強のアタックポイント」を水色の二重丸で強調表示
+            if best_ap:
+                orig_ap = (best_ap[1] * scale_inv, best_ap[0] * scale_inv)
+                cv2.circle(vis, orig_ap, 15, (255, 255, 0), 4)
 
             cv2.circle(vis, orig_start, 30, purple, 5)
             cv2.circle(vis, orig_goal, 30, purple, 5)
@@ -279,7 +320,7 @@ if uploaded_file is not None:
                     cv2.line(vis, pt1, pt2, color, thickness=4)
 
             st.subheader("🗺️ AIルート解析結果")
-            st.image(vis, channels="BGR", caption="赤:最適解 / 青:第2候補 / 緑:第3候補", use_container_width=True)
+            st.image(vis, channels="BGR", caption="赤:最適解 / 青:AP経由(人間的) / 緑:大穴", use_container_width=True)
             
             st.subheader("📊 ルートごとのパフォーマンス比較")
             cols = st.columns(len(metrics))
@@ -288,7 +329,7 @@ if uploaded_file is not None:
                 with col:
                     st.markdown(f"**{m['色']} : {m['名前']}**")
                     st.metric(label="難易度スコア (推定タイム)", value=m["難易度スコア"])
-                    st.metric(label="移動距離 (ピクセル)", value=m["相対距離"])
+                    st.metric(label="移動距離 (ピクセル)", value=m["距離"])
 
 else:
     st.info("上のボックスから地図画像をアップロードすると自動的に解析が始まります。")
