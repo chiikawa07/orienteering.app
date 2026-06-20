@@ -8,7 +8,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # UI: タイトルとページ設定
 # ==========================================
 st.set_page_config(layout="wide") # 地図を大きく見せるためにワイド表示
-st.title("オリエンテーリングAI (高画質対応版)")
+st.title("オリエンテーリングAI (高画質＆クリック修正版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -16,9 +16,10 @@ if uploaded_file is not None:
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     # =========================
-    # ① 画像読み込み & K-Meansによる完全自動減色 (画質を改善)
+    # ① 画像読み込み & K-Meansによる完全自動減色
     # =========================
-    scale = 0.5  # ★荒さを改善するため、0.2 から 0.5 に変更
+    # 画質と処理速度のバランスが最も良い 0.35 に設定
+    scale = 0.35  
     small_img = cv2.resize(img, (0,0), fx=scale, fy=scale)
     h_s, w_s = small_img.shape[:2]
 
@@ -120,14 +121,14 @@ if uploaded_file is not None:
     grad_mag = cv2.magnitude(grad_x, grad_y)
     grad_x = np.where(grad_mag > 0, grad_x / grad_mag, 0.0)
     grad_y = np.where(grad_mag > 0, grad_y / grad_mag, 0.0)
-    # 高画質化に合わせてぼかしのカーネルサイズを調整 (21->51)
-    slope_heatmap = cv2.GaussianBlur(mask_brown, (51, 51), 0) 
+    
+    slope_heatmap = cv2.GaussianBlur(mask_brown, (31, 31), 0) 
     slope_penalty = (slope_heatmap / 255.0) * slope_weight
 
     inv_road = cv2.bitwise_not(road_mask)
     dist_to_road = cv2.distanceTransform(inv_road, cv2.DIST_L2, 5)
-    dist_capped = np.clip(dist_to_road, 0, 100) # 距離制限も調整 (50->100)
-    nav_penalty = (dist_capped / 100.0) * nav_weight
+    dist_capped = np.clip(dist_to_road, 0, 80) 
+    nav_penalty = (dist_capped / 80.0) * nav_weight
 
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
@@ -141,8 +142,8 @@ if uploaded_file is not None:
     small_cost[wall_mask > 0] = 9999
     small_cost[mask_blue > 0] = 9999
 
-    # 高画質化に合わせてズル防止の壁を厚くする
-    margin = 30 # 15 -> 30
+    # 端の壁
+    margin = 20 
     small_cost[0:margin, :] = 9999
     small_cost[-margin:, :] = 9999
     small_cost[:, 0:margin] = 9999
@@ -215,13 +216,15 @@ if uploaded_file is not None:
         return path[::-1]
 
     # =========================
-    # ⑨ 大画面フルサイズのクリックUI
+    # ⑨ 【完全修正】大画面フルサイズ＆ズレないクリックUI
     # =========================
-    if 'start_y' not in st.session_state:
-        st.session_state.start_y = int(h_s * 0.77)
-        st.session_state.start_x = int(w_s * 0.53)
-        st.session_state.goal_y = int(h_s * 0.50)
-        st.session_state.goal_x = int(w_s * 0.70)
+    # ピクセル座標ではなく「画像の縦横の割合 (0.0~1.0)」で保存する
+    # これにより、画質や画面サイズが変わっても絶対にズレません
+    if 'start_nx' not in st.session_state:
+        st.session_state.start_nx = 0.53
+        st.session_state.start_ny = 0.77
+        st.session_state.goal_nx = 0.70
+        st.session_state.goal_ny = 0.50
     if 'last_click' not in st.session_state:
         st.session_state.last_click = None
 
@@ -230,31 +233,58 @@ if uploaded_file is not None:
     
     point_type = st.radio("クリックで動かすポイントを選択:", ["🔵 スタート", "🔴 ゴール"], horizontal=True)
     
+    # クリック領域の画像を固定幅(800px)にリサイズして表示（座標ズレを防ぐため）
+    ui_width = 800
+    ui_ratio = ui_width / w_s
+    ui_height = int(h_s * ui_ratio)
+
     click_map_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
+    click_map_ui = cv2.resize(click_map_img, (ui_width, ui_height))
     
-    cv2.circle(click_map_img, (st.session_state.start_x, st.session_state.start_y), 6, (255, 0, 255), -1)
-    cv2.putText(click_map_img, "S", (st.session_state.start_x + 8, st.session_state.start_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-    cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 6, (255, 0, 255), 2)
-    cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 2, (255, 0, 255), -1)
-    cv2.putText(click_map_img, "G", (st.session_state.goal_x + 8, st.session_state.goal_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+    # マーカーの描画位置を計算
+    ui_sx = int(st.session_state.start_nx * ui_width)
+    ui_sy = int(st.session_state.start_ny * ui_height)
+    ui_gx = int(st.session_state.goal_nx * ui_width)
+    ui_gy = int(st.session_state.goal_ny * ui_height)
+
+    cv2.circle(click_map_ui, (ui_sx, ui_sy), 8, (255, 0, 255), -1)
+    cv2.putText(click_map_ui, "S", (ui_sx + 10, ui_sy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+    cv2.circle(click_map_ui, (ui_gx, ui_gy), 8, (255, 0, 255), 2)
+    cv2.circle(click_map_ui, (ui_gx, ui_gy), 3, (255, 0, 255), -1)
+    cv2.putText(click_map_ui, "G", (ui_gx + 10, ui_gy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
     
-    click_val = streamlit_image_coordinates(click_map_img, key="map_click", use_column_width=True)
+    # use_column_width を外し、等倍表示にすることで座標ズレを完全にシャットアウト
+    click_val = streamlit_image_coordinates(click_map_ui, key="map_click")
 
     if click_val is not None and click_val != st.session_state.last_click:
         st.session_state.last_click = click_val
-        safe_x = max(margin, min(click_val['x'], w_s - margin - 1))
-        safe_y = max(margin, min(click_val['y'], h_s - margin - 1))
+        
+        # クリック座標から「割合」を逆算
+        nx = click_val['x'] / ui_width
+        ny = click_val['y'] / ui_height
         
         if point_type == "🔵 スタート":
-            st.session_state.start_x = safe_x
-            st.session_state.start_y = safe_y
+            st.session_state.start_nx = nx
+            st.session_state.start_ny = ny
         else:
-            st.session_state.goal_x = safe_x
-            st.session_state.goal_y = safe_y
+            st.session_state.goal_nx = nx
+            st.session_state.goal_ny = ny
         st.rerun()
 
-    start = (st.session_state.start_y, st.session_state.start_x)
-    goal = (st.session_state.goal_y, st.session_state.goal_x)
+    # AI探索用の実際のピクセル座標（small_img基準）に変換
+    sx = int(st.session_state.start_nx * w_s)
+    sy = int(st.session_state.start_ny * h_s)
+    gx = int(st.session_state.goal_nx * w_s)
+    gy = int(st.session_state.goal_ny * h_s)
+
+    # 画面外エラーを防ぐセーフティ
+    sx = max(margin, min(sx, w_s - margin - 1))
+    sy = max(margin, min(sy, h_s - margin - 1))
+    gx = max(margin, min(gx, w_s - margin - 1))
+    gy = max(margin, min(gy, h_s - margin - 1))
+
+    start = (sy, sx)
+    goal = (gy, gx)
 
     # =========================
     # ⑩ 経路探索実行
@@ -322,12 +352,14 @@ if uploaded_file is not None:
             # ⑪ 可視化とダッシュボード
             # =========================
             vis = img.copy()
-            scale_inv = int(1 / scale)
             h_orig, w_orig = img.shape[:2]
             purple = (255, 0, 255)
 
-            orig_start = (st.session_state.start_x * scale_inv, st.session_state.start_y * scale_inv)
-            orig_goal = (st.session_state.goal_x * scale_inv, st.session_state.goal_y * scale_inv)
+            # 元画像（フル解像度）に対する描画座標を割合から計算
+            orig_start = (int(st.session_state.start_nx * w_orig), int(st.session_state.start_ny * h_orig))
+            orig_goal = (int(st.session_state.goal_nx * w_orig), int(st.session_state.goal_ny * h_orig))
+
+            scale_inv = int(1 / scale)
 
             for ap in attack_points:
                 cv2.circle(vis, (ap[1] * scale_inv, ap[0] * scale_inv), 4, (0, 255, 255), -1)
@@ -344,8 +376,8 @@ if uploaded_file is not None:
                 path = routes[i]
                 color = colors[i]
                 for j in range(len(path) - 1):
-                    pt1 = (path[j][1] * scale_inv, path[j][0] * scale_inv)
-                    pt2 = (path[j+1][1] * scale_inv, path[j+1][0] * scale_inv)
+                    pt1 = (int(path[j][1] / scale), int(path[j][0] / scale))
+                    pt2 = (int(path[j+1][1] / scale), int(path[j+1][0] / scale))
                     cv2.line(vis, pt1, pt2, color, thickness=4)
 
             st.image(vis, channels="BGR", caption="赤:最適解 / 青:AP経由(人間的) / 緑:大穴", use_container_width=True)
