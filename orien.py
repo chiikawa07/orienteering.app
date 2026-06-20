@@ -8,7 +8,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # UI: タイトルとページ設定
 # ==========================================
 st.set_page_config(layout="wide") # 地図を大きく見せるためにワイド表示
-st.title("オリエンテーリングAI (クリック＆ワイド表示版)")
+st.title("オリエンテーリングAI (高画質対応版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -16,9 +16,9 @@ if uploaded_file is not None:
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     # =========================
-    # ① 画像読み込み & K-Meansによる完全自動減色
+    # ① 画像読み込み & K-Meansによる完全自動減色 (画質を改善)
     # =========================
-    scale = 0.2
+    scale = 0.5  # ★荒さを改善するため、0.2 から 0.5 に変更
     small_img = cv2.resize(img, (0,0), fx=scale, fy=scale)
     h_s, w_s = small_img.shape[:2]
 
@@ -111,6 +111,7 @@ if uploaded_file is not None:
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧭 ナビゲーション難易度の設定")
+    st.sidebar.write("数値を上げると、現在地を見失わないよう道や小径（ハンドレール）の近くを好んで走るようになります。")
     nav_weight = st.sidebar.slider("道から離れることへの不安度 (ペナルティ)", 0.0, 10.0, 3.0, step=0.5)
 
     brown_blur = cv2.GaussianBlur(mask_brown, (5, 5), 0)
@@ -119,13 +120,14 @@ if uploaded_file is not None:
     grad_mag = cv2.magnitude(grad_x, grad_y)
     grad_x = np.where(grad_mag > 0, grad_x / grad_mag, 0.0)
     grad_y = np.where(grad_mag > 0, grad_y / grad_mag, 0.0)
-    slope_heatmap = cv2.GaussianBlur(mask_brown, (21, 21), 0)
+    # 高画質化に合わせてぼかしのカーネルサイズを調整 (21->51)
+    slope_heatmap = cv2.GaussianBlur(mask_brown, (51, 51), 0) 
     slope_penalty = (slope_heatmap / 255.0) * slope_weight
 
     inv_road = cv2.bitwise_not(road_mask)
     dist_to_road = cv2.distanceTransform(inv_road, cv2.DIST_L2, 5)
-    dist_capped = np.clip(dist_to_road, 0, 50)
-    nav_penalty = (dist_capped / 50.0) * nav_weight
+    dist_capped = np.clip(dist_to_road, 0, 100) # 距離制限も調整 (50->100)
+    nav_penalty = (dist_capped / 100.0) * nav_weight
 
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
@@ -139,7 +141,8 @@ if uploaded_file is not None:
     small_cost[wall_mask > 0] = 9999
     small_cost[mask_blue > 0] = 9999
 
-    margin = 15
+    # 高画質化に合わせてズル防止の壁を厚くする
+    margin = 30 # 15 -> 30
     small_cost[0:margin, :] = 9999
     small_cost[-margin:, :] = 9999
     small_cost[:, 0:margin] = 9999
@@ -212,7 +215,7 @@ if uploaded_file is not None:
         return path[::-1]
 
     # =========================
-    # ⑨ 【修正】大画面フルサイズのクリックUI
+    # ⑨ 大画面フルサイズのクリックUI
     # =========================
     if 'start_y' not in st.session_state:
         st.session_state.start_y = int(h_s * 0.77)
@@ -225,20 +228,16 @@ if uploaded_file is not None:
     st.markdown("---")
     st.subheader("📍 1. ルートを設定する (地図をクリック)")
     
-    # ラジオボタンを横並び（horizontal=True）にしてスッキリさせる
     point_type = st.radio("クリックで動かすポイントを選択:", ["🔵 スタート", "🔴 ゴール"], horizontal=True)
     
-    # クリック用の画像を作成
     click_map_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
     
-    # スタートとゴールの描画
     cv2.circle(click_map_img, (st.session_state.start_x, st.session_state.start_y), 6, (255, 0, 255), -1)
     cv2.putText(click_map_img, "S", (st.session_state.start_x + 8, st.session_state.start_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
     cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 6, (255, 0, 255), 2)
     cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 2, (255, 0, 255), -1)
     cv2.putText(click_map_img, "G", (st.session_state.goal_x + 8, st.session_state.goal_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
     
-    # 【最重要】use_column_width=True を指定して、はみ出しを防ぎつつ画面横幅いっぱいに広げる！
     click_val = streamlit_image_coordinates(click_map_img, key="map_click", use_column_width=True)
 
     if click_val is not None and click_val != st.session_state.last_click:
@@ -266,7 +265,7 @@ if uploaded_file is not None:
     if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
         st.error("⚠️ スタートまたはゴールが通行不可エリアです。別の場所をクリックしてください。")
     else:
-        with st.spinner('AIがアタックポイントを経由する人間的ルートを探索中...'):
+        with st.spinner('AIが地形と「ナビのしやすさ」を総合評価して探索中...'):
             routes = []
             metrics = []
             colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)]
