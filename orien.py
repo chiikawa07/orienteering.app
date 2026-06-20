@@ -227,13 +227,13 @@ if uploaded_file is not None:
     with col_panel:
         point_type = st.radio("📌 地図をクリックして移動:", ["🔵 スタート", "🔴 ゴール"])
         
-        # ★追加: クリックが死んだ場合の絶対動くスライダー★
+        # ★完全修正版: key縛りを無くし、valueで状態を渡すだけにする★
         with st.expander("🎯 クリックが効かない場合の微調整", expanded=False):
             st.warning("ブラウザが重くてクリックが反応しない場合は、こちらのスライダーで位置を調整してください。")
-            st.slider("スタートの横位置 (X)", 0.0, 1.0, key="start_nx", step=0.01)
-            st.slider("スタートの縦位置 (Y)", 0.0, 1.0, key="start_ny", step=0.01)
-            st.slider("ゴールの横位置 (X)", 0.0, 1.0, key="goal_nx", step=0.01)
-            st.slider("ゴールの縦位置 (Y)", 0.0, 1.0, key="goal_ny", step=0.01)
+            st.session_state.start_nx = st.slider("スタートの横位置 (X)", 0.0, 1.0, value=float(st.session_state.start_nx), step=0.01)
+            st.session_state.start_ny = st.slider("スタートの縦位置 (Y)", 0.0, 1.0, value=float(st.session_state.start_ny), step=0.01)
+            st.session_state.goal_nx = st.slider("ゴールの横位置 (X)", 0.0, 1.0, value=float(st.session_state.goal_nx), step=0.01)
+            st.session_state.goal_ny = st.slider("ゴールの縦位置 (Y)", 0.0, 1.0, value=float(st.session_state.goal_ny), step=0.01)
 
     margin = 40
     sx = max(margin, min(int(st.session_state.start_nx * w_s), w_s - margin - 1))
