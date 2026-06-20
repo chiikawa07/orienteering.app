@@ -66,6 +66,7 @@ def parse_gpx_data(file_bytes):
                 segments.append(pts)
         return segments
     except Exception as e:
+        st.error(f"GPXファイルの解析に失敗しました: {e}")
         return []
 
 def get_color_for_pace(pace):
@@ -84,6 +85,17 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     small_img = cv2.resize(img, (0,0), fx=scale, fy=scale)
     h_s, w_s = small_img.shape[:2]
 
+    # ★NEW: 紫色（マゼンタ）の立入禁止エリアをHSV空間で抽出
+    hsv = cv2.cvtColor(small_img, cv2.COLOR_BGR2HSV)
+    lower_mag = np.array([125, 40, 40])  # マゼンタの範囲
+    upper_mag = np.array([175, 255, 255])
+    mask_magenta = cv2.inRange(hsv, lower_mag, upper_mag)
+    
+    # 網掛けの線を繋げて巨大な壁にする
+    kernel_mag = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    mask_magenta_wall = cv2.dilate(mask_magenta, kernel_mag, iterations=2)
+
+    # いつものK-Means減色
     Z = np.float32(small_img.reshape((-1, 3)))
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
     _, label, center = cv2.kmeans(Z, 6, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
@@ -145,12 +157,9 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     small_cost = small_cost + slope_penalty + nav_penalty
     small_cost[wall_mask > 0] = 9999
     small_cost[masks["blue"] > 0] = 9999
-
-    margin = 40 
-    small_cost[0:margin, :] = 9999
-    small_cost[-margin:, :] = 9999
-    small_cost[:, 0:margin] = 9999
-    small_cost[:, -margin:] = 9999
+    
+    # ★NEW: 紫色の壁を追加
+    small_cost[mask_magenta_wall > 0] = 9999
 
     return h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost
 
@@ -191,7 +200,7 @@ def dijkstra(cost_map, gx_mat, gy_mat, g_mag, start, goal):
     return path[::-1]
 
 # ==========================================
-# セッション初期化 (スライダーと連動させるため)
+# セッション初期化
 # ==========================================
 if 'start_nx' not in st.session_state:
     st.session_state.start_nx, st.session_state.start_ny = 0.53, 0.77
@@ -227,32 +236,52 @@ if uploaded_file is not None:
     with col_panel:
         point_type = st.radio("📌 地図をクリックして移動:", ["🔵 スタート", "🔴 ゴール"])
         
-        # ★完全修正版: key縛りを無くし、valueで状態を渡すだけにする★
+        # ★NEW: 競技エリアをトリミングするスライダーを追加
+        with st.expander("✂️ 競技エリアの制限 (余白カット)", expanded=False):
+            st.write("AIが地図の白い余白を「森」と勘違いするのを防ぎます。")
+            crop_top = st.slider("上部のカット (%)", 0, 50, 0)
+            crop_bottom = st.slider("下部のカット (%)", 0, 50, 0)
+            crop_left = st.slider("左側のカット (%)", 0, 50, 0)
+            crop_right = st.slider("右側のカット (%)", 0, 50, 0)
+
         with st.expander("🎯 クリックが効かない場合の微調整", expanded=False):
-            st.warning("ブラウザが重くてクリックが反応しない場合は、こちらのスライダーで位置を調整してください。")
             st.session_state.start_nx = st.slider("スタートの横位置 (X)", 0.0, 1.0, value=float(st.session_state.start_nx), step=0.01)
             st.session_state.start_ny = st.slider("スタートの縦位置 (Y)", 0.0, 1.0, value=float(st.session_state.start_ny), step=0.01)
             st.session_state.goal_nx = st.slider("ゴールの横位置 (X)", 0.0, 1.0, value=float(st.session_state.goal_nx), step=0.01)
             st.session_state.goal_ny = st.slider("ゴールの縦位置 (Y)", 0.0, 1.0, value=float(st.session_state.goal_ny), step=0.01)
 
-    margin = 40
-    sx = max(margin, min(int(st.session_state.start_nx * w_s), w_s - margin - 1))
-    sy = max(margin, min(int(st.session_state.start_ny * h_s), h_s - margin - 1))
-    gx = max(margin, min(int(st.session_state.goal_nx * w_s), w_s - margin - 1))
-    gy = max(margin, min(int(st.session_state.goal_ny * h_s), h_s - margin - 1))
+    # ★NEW: トリミング領域をコストマップに反映
+    search_cost = small_cost.copy()
+    t_m = int(h_s * (crop_top / 100))
+    b_m = int(h_s * (1 - crop_bottom / 100))
+    l_m = int(w_s * (crop_left / 100))
+    r_m = int(w_s * (1 - crop_right / 100))
+
+    search_cost[0:t_m, :] = 9999
+    search_cost[b_m:h_s, :] = 9999
+    search_cost[:, 0:l_m] = 9999
+    search_cost[:, r_m:w_s] = 9999
+
+    sx = max(0, min(int(st.session_state.start_nx * w_s), w_s - 1))
+    sy = max(0, min(int(st.session_state.start_ny * h_s), h_s - 1))
+    gx = max(0, min(int(st.session_state.goal_nx * w_s), w_s - 1))
+    gy = max(0, min(int(st.session_state.goal_ny * h_s), h_s - 1))
     start, goal = (sy, sx), (gy, gx)
 
     routes, metrics = [], []
-    if small_cost[start] < 9999 and small_cost[goal] < 9999:
-        path1 = dijkstra(small_cost, grad_x, grad_y, grad_mag, start, goal)
+    # ★修正: カットした場所をクリックするとエラーを出してユーザーに知らせる
+    if search_cost[start] >= 9999 or search_cost[goal] >= 9999:
+        st.error("⚠️ スタートまたはゴールが『立入禁止エリア』または『カットされた余白』にあります。位置を調整してください。")
+    else:
+        path1 = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, goal)
         if path1 and len(path1) > 1:
             routes.append((path1, (0, 0, 255)))
             metrics.append({"名前": "AI 最適解", "色": "🔴 赤", "スコア": round(sum(small_cost[p[0], p[1]] for p in path1), 1)})
 
         best_ap = min(attack_points, key=lambda p: np.hypot(p[0]-goal[0], p[1]-goal[1])) if attack_points else None
-        if best_ap:
-            path_to_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, start, best_ap)
-            path_from_ap = dijkstra(small_cost, grad_x, grad_y, grad_mag, best_ap, goal)
+        if best_ap and search_cost[best_ap] < 9999:
+            path_to_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, best_ap)
+            path_from_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, best_ap, goal)
             if path_to_ap and path_from_ap:
                 path2 = path_to_ap[:-1] + path_from_ap
                 routes.append((path2, (255, 0, 0)))
@@ -262,10 +291,18 @@ if uploaded_file is not None:
     h_orig, w_orig = vis.shape[:2]
     scale_inv = 1 / scale
 
+    # ★NEW: 画面上にカットした境界線を黒枠で描画する
+    t_orig = int(h_orig * (crop_top / 100))
+    b_orig = int(h_orig * (1 - crop_bottom / 100))
+    l_orig = int(w_orig * (crop_left / 100))
+    r_orig = int(w_orig * (1 - crop_right / 100))
+    cv2.rectangle(vis, (l_orig, t_orig), (r_orig, b_orig), (0, 0, 0), 4)
+
     orig_start = (int(st.session_state.start_nx * w_orig), int(st.session_state.start_ny * h_orig))
     orig_goal = (int(st.session_state.goal_nx * w_orig), int(st.session_state.goal_ny * h_orig))
 
-    if best_ap: cv2.circle(vis, (int(best_ap[1] * scale_inv), int(best_ap[0] * scale_inv)), 15, (255, 255, 0), 4)
+    if 'best_ap' in locals() and best_ap: 
+        cv2.circle(vis, (int(best_ap[1] * scale_inv), int(best_ap[0] * scale_inv)), 15, (255, 255, 0), 4)
 
     with col_panel:
         st.markdown("### 🏃‍♂️ ルート比較")
