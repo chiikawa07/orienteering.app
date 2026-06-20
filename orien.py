@@ -330,34 +330,58 @@ if uploaded_file is not None:
             st.markdown("<hr>", unsafe_allow_html=True)
             
             with st.expander("⚙️ GPS位置合わせ", expanded=True):
+                st.write("※軌跡が自動で地図の大きさにフィットしています。微調整してください。")
                 gpx_scale = st.slider("拡大率", 0.1, 5.0, 1.0, step=0.05)
                 gpx_rot = st.slider("回転角度", -180, 180, 0, step=1)
-                gpx_offset_x = st.slider("左右移動 (X)", -5000, 5000, 0, step=10)
-                gpx_offset_y = st.slider("上下移動 (Y)", -5000, 5000, 0, step=10)
+                gpx_offset_x = st.slider("左右移動 (X)", -2000, 2000, 0, step=10)
+                gpx_offset_y = st.slider("上下移動 (Y)", -2000, 2000, 0, step=10)
         else:
             gpx_scale, gpx_rot, gpx_offset_x, gpx_offset_y = 1.0, 0, 0, 0
 
     # ==========================================
-    # ★ GPS軌跡のスピード別・色分け描画
+    # ★ GPS軌跡の「オートフィット」＆「スピード色分け描画」
     # ==========================================
     if gpx_segments:
         all_lats = [p[0] for seg in gpx_segments for p in seg]
         all_lons = [p[1] for seg in gpx_segments for p in seg]
-        center_lat, center_lon = (min(all_lats) + max(all_lats)) / 2, (min(all_lons) + max(all_lons)) / 2
-        lat_range = max(all_lats) - min(all_lats) if max(all_lats) != min(all_lats) else 1e-6
-        lon_range = max(all_lons) - min(all_lons) if max(all_lons) != min(all_lons) else 1e-6
-        base_scale = min(w_orig, h_orig)
+        center_lat = (min(all_lats) + max(all_lats)) / 2
+        center_lon = (min(all_lons) + max(all_lons)) / 2
+
+        # 緯度・経度をメートル(m)の距離に変換する係数（メルカトル図法近似）
+        avg_lat_rad = np.radians(center_lat)
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = 40075000.0 * np.cos(avg_lat_rad) / 360.0
+
+        lat_range = max(all_lats) - min(all_lats)
+        lon_range = max(all_lons) - min(all_lons)
+        
+        track_w_m = lon_range * m_per_deg_lon
+        track_h_m = lat_range * m_per_deg_lat
+        max_track_dim = max(track_w_m, track_h_m) if max(track_w_m, track_h_m) > 0 else 1.0
+
+        # 地図の短辺の「80%」にぴったり収まるように基準となるピクセル倍率を算出
+        target_px = min(w_orig, h_orig) * 0.8
+        pixels_per_meter = target_px / max_track_dim
 
         for seg in gpx_segments:
             gpx_pixels = []
             for lat, lon, time_obj in seg:
-                nx = (lon - center_lon) / lon_range
-                ny = -(lat - center_lat) / lat_range
-                dx, dy = nx * base_scale * gpx_scale, ny * base_scale * gpx_scale
+                # 中心地からの距離をメートルに変換
+                dx_m = (lon - center_lon) * m_per_deg_lon
+                dy_m = -(lat - center_lat) * m_per_deg_lat
+                
+                # メートルからピクセルに変換（スライダーのscaleを掛ける）
+                dx = dx_m * pixels_per_meter * gpx_scale
+                dy = dy_m * pixels_per_meter * gpx_scale
+                
+                # 回転の適用
                 rad = np.radians(gpx_rot)
                 rx = dx * np.cos(rad) - dy * np.sin(rad)
                 ry = dx * np.sin(rad) + dy * np.cos(rad)
-                gpx_pixels.append((int(w_orig / 2 + rx + gpx_offset_x), int(h_orig / 2 + ry + gpx_offset_y)))
+                
+                px = int(w_orig / 2 + rx + gpx_offset_x)
+                py = int(h_orig / 2 + ry + gpx_offset_y)
+                gpx_pixels.append((px, py))
             
             for i in range(len(gpx_pixels) - 1):
                 pt1, pt2 = gpx_pixels[i], gpx_pixels[i+1]
@@ -369,16 +393,15 @@ if uploaded_file is not None:
                 if t1 and t2:
                     dist_km = haversine_distance((lat1, lon1), (lat2, lon2))
                     dt_sec = (t2 - t1).total_seconds()
-                    if dist_km > 0.002 and dt_sec > 0: # 誤差を除外
+                    if dist_km > 0.002 and dt_sec > 0:
                         pace = (dt_sec / 60.0) / dist_km
                 
-                # 速度に応じた色を取得
                 seg_color = get_color_for_pace(pace)
                 
-                if (0 <= pt1[0] < w_orig and 0 <= pt1[1] < h_orig and 0 <= pt2[0] < w_orig and 0 <= pt2[1] < h_orig):
-                    # 白いフチドリを描いてから、中にスピード色を描画
-                    cv2.line(vis, pt1, pt2, (255, 255, 255), thickness=6)
-                    cv2.line(vis, pt1, pt2, seg_color, thickness=3)
+                # OpenCVは画面外にはみ出た描画を自動で無視してくれるので、
+                # 複雑なif条件を外してそのまま描画命令を投げる
+                cv2.line(vis, pt1, pt2, (255, 255, 255), thickness=6)
+                cv2.line(vis, pt1, pt2, seg_color, thickness=3)
 
     cv2.circle(vis, orig_start, 30, (255, 0, 255), 5)
     cv2.circle(vis, orig_goal, 30, (255, 0, 255), 5)
