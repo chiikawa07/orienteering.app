@@ -164,7 +164,9 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     small_cost[masks["blue"] > 0] = 9999
     small_cost[mask_magenta_wall > 0] = 9999
  
-    return h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled, used_magenta_boundary
+    magenta_pixel_count = int(cv2.countNonZero(mask_magenta))
+ 
+    return h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled, used_magenta_boundary, magenta_pixel_count
  
  
 def build_competition_area_mask(mask_white, mask_magenta, h_s, w_s):
@@ -357,7 +359,7 @@ if uploaded_file is not None:
  
     scale = 0.35
     file_bytes = bytes(uploaded_file.read())
-    (h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled, used_magenta_boundary) = process_map_data(file_bytes, scale, 20.0, 3.0)
+    (h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled, used_magenta_boundary, magenta_pixel_count) = process_map_data(file_bytes, scale, 20.0, 3.0)
  
     with col_panel:
         point_type = st.radio("📌 地図をクリックして移動:", ["🔵 スタート", "🔴 ゴール"])
@@ -368,9 +370,13 @@ if uploaded_file is not None:
             
             if use_auto_crop:
                 if used_magenta_boundary:
-                    st.success("✅ 紫線（No mapping境界）を検出し、競技エリアを確定しました。")
+                    st.success(f"✅ 紫線（No mapping境界）を検出し、競技エリアを確定しました。（検出ピクセル数: {magenta_pixel_count}）")
                 else:
-                    st.info("自動トリミング適用中（紫線が見つからないため、色領域から推定しています）")
+                    st.info(f"自動トリミング適用中（紫線が見つからないため、色領域から推定しています）")
+                    if magenta_pixel_count > 0:
+                        st.caption(f"⚠️ 紫色の画素は{magenta_pixel_count}個検出されましたが、閉じた境界として認識できませんでした（線が薄い・途切れすぎている可能性があります）。")
+                    else:
+                        st.caption("⚠️ 紫色の画素が全く検出されませんでした。地図の色設定が標準と異なるかもしれません。")
             else:
                 crop_top = st.slider("上部のカット (%)", 0, 50, 0)
                 crop_bottom = st.slider("下部のカット (%)", 0, 50, 0)
@@ -501,7 +507,16 @@ if uploaded_file is not None:
  
         if click_val is not None and click_val != st.session_state.last_click:
             st.session_state.last_click = click_val
-            nx, ny = click_val['x'] / w_orig, click_val['y'] / h_orig
+            # ★FIX: click_val の x, y は「実際に画面に表示されている画像の幅高さ」
+            # (click_val['width'] / click_val['height']) を基準にしたオフセットで
+            # 返ってくる。streamlit_image_coordinates は width=1000 で表示しているので、
+            # 元画像の実寸 w_orig / h_orig で割ると正規化座標が大きくズレてしまう。
+            # click_val 自身が返す表示サイズで割るのが正しい。
+            disp_w = click_val.get('width') or 1000
+            disp_h = click_val.get('height') or (vis_rgb.shape[0] * disp_w / vis_rgb.shape[1])
+            nx, ny = click_val['x'] / disp_w, click_val['y'] / disp_h
+            nx = max(0.0, min(1.0, nx))
+            ny = max(0.0, min(1.0, ny))
             if point_type == "🔵 スタート":
                 st.session_state.start_nx, st.session_state.start_ny = nx, ny
             else:
@@ -509,3 +524,6 @@ if uploaded_file is not None:
             st.rerun() 
 else:
     st.info("左のパネルから地図画像をアップロードしてください。")
+ 
+
+
