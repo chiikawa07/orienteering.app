@@ -11,7 +11,6 @@ import xml.etree.ElementTree as ET
 st.set_page_config(layout="wide")
 st.title("オリエンテーリングAI (GPSログ重ね合わせ版)")
 
-# 2つのファイルをアップロードできるように配置
 col_file1, col_file2 = st.columns(2)
 with col_file1:
     uploaded_file = st.file_uploader("1. 地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
@@ -20,7 +19,7 @@ with col_file2:
 
 # 2点間の球面距離(km)を計算するハバーシン公式
 def haversine_distance(p1, p2):
-    R = 6371.0  # 地球の半径 (km)
+    R = 6371.0
     lat1, lon1 = np.radians(p1[0]), np.radians(p1[1])
     lat2, lon2 = np.radians(p2[0]), np.radians(p2[1])
     dlat = lat2 - lat1
@@ -29,17 +28,32 @@ def haversine_distance(p1, p2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
-# GPXファイルをパースして緯度経度のリストを返す関数
+# ★修正：GPXデータを「セグメント（線の切れ目）」ごとに分けて取得する
 def parse_gpx_data(file_bytes):
     try:
         root = ET.fromstring(file_bytes)
-        points = []
-        for el in root.iter():
-            if el.tag.endswith('trkpt'):
-                lat = float(el.attrib['lat'])
-                lon = float(el.attrib['lon'])
-                points.append((lat, lon))
-        return points
+        segments = []
+        for trkseg in root.iter():
+            if trkseg.tag.endswith('trkseg'):
+                seg_points = []
+                for pt in trkseg.iter():
+                    if pt.tag.endswith('trkpt'):
+                        lat = float(pt.attrib['lat'])
+                        lon = float(pt.attrib['lon'])
+                        seg_points.append((lat, lon))
+                if seg_points:
+                    segments.append(seg_points)
+        # トラックがない場合はルートやウェイポイントを探す
+        if not segments:
+            pts = []
+            for pt in root.iter():
+                if pt.tag.endswith('rtept') or pt.tag.endswith('wpt'):
+                    lat = float(pt.attrib['lat'])
+                    lon = float(pt.attrib['lon'])
+                    pts.append((lat, lon))
+            if pts:
+                segments.append(pts)
+        return segments
     except Exception as e:
         st.error(f"GPXファイルの解析に失敗しました: {e}")
         return []
@@ -55,7 +69,6 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     small_img = cv2.resize(img, (0,0), fx=scale, fy=scale)
     h_s, w_s = small_img.shape[:2]
 
-    # K-Means減色
     Z = small_img.reshape((-1, 3))
     Z = np.float32(Z)
     K = 6
@@ -65,7 +78,6 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     center = np.uint8(center)
     labels_reshaped = label.reshape((h_s, w_s))
 
-    # ISOM色マッチング
     isom_colors = {
         "white": np.array([245, 245, 245], dtype=np.uint8),
         "black": np.array([40, 40, 40], dtype=np.uint8),
@@ -96,7 +108,6 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     mask_brown = masks["brown"]
     mask_blue = masks["blue"]
 
-    # 道・建物の判別
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask_black_closed = cv2.morphologyEx(mask_black, cv2.MORPH_CLOSE, kernel_close)
     road_mask = np.zeros_like(mask_black)
@@ -115,7 +126,6 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
         else:
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
-    # アタックポイント抽出
     corners = cv2.goodFeaturesToTrack(road_mask, maxCorners=50, qualityLevel=0.1, minDistance=20)
     attack_points = []
     if corners is not None:
@@ -123,7 +133,6 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
             cx, cy = i.ravel()
             attack_points.append((int(cy), int(cx)))
 
-    # ベクトル・ペナルティ計算
     brown_blur = cv2.GaussianBlur(mask_brown, (5, 5), 0)
     grad_x = cv2.Sobel(brown_blur, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(brown_blur, cv2.CV_32F, 0, 1, ksize=3)
@@ -139,7 +148,6 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     dist_capped = np.clip(dist_to_road, 0, 80) 
     nav_penalty = (dist_capped / 80.0) * nav_weight
 
-    # コストマップ合成
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
     small_cost[mask_yellow > 0] = 0.8
@@ -163,17 +171,16 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
 # メイン処理開始
 # ==========================================
 if uploaded_file is not None:
-    # 1. 走行ログの読み込み処理（存在する場合）
-    gpx_points = []
+    gpx_segments = []
     total_gpx_dist = 0.0
+    total_pts = 0
     if gpx_file is not None:
-        gpx_points = parse_gpx_data(gpx_file.read())
-        if gpx_points:
-            # 実走行距離(km)の算出
-            for i in range(len(gpx_points) - 1):
-                total_gpx_dist += haversine_distance(gpx_points[i], gpx_points[i+1])
+        gpx_segments = parse_gpx_data(gpx_file.read())
+        for seg in gpx_segments:
+            total_pts += len(seg)
+            for i in range(len(seg) - 1):
+                total_gpx_dist += haversine_distance(seg[i], seg[i+1])
 
-    # サイドバーのUI
     st.sidebar.markdown("---")
     st.sidebar.subheader("⛰️ アップダウン・沢またぎの回避設定")
     slope_weight = st.sidebar.slider("斜度の基本ペナルティ (全体の回避度)", 0.0, 50.0, 20.0, step=2.0)
@@ -183,32 +190,26 @@ if uploaded_file is not None:
     st.sidebar.subheader("🧭 ナビゲーション難易度の設定")
     nav_weight = st.sidebar.slider("道から離れることへの不安度", 0.0, 10.0, 3.0, step=0.5)
 
-    # 2. GPSキャリブレーションUIの追加（ログがある場合のみ出現）
     gpx_scale, gpx_rot, gpx_offset_x, gpx_offset_y = 1.0, 0, 0, 0
-    if gpx_points:
+    if gpx_segments:
         st.sidebar.markdown("---")
         st.sidebar.subheader("🏃‍♂️ GPSログの位置同期（位置合わせ）")
         st.sidebar.write("地図上の道と軌跡が重なるように調整してください。")
-        gpx_scale = st.sidebar.slider("GPS軌跡の拡大率", 0.1, 10.0, 1.5, step=0.05)
+        gpx_scale = st.sidebar.slider("GPS軌跡の拡大率", 0.1, 5.0, 1.0, step=0.05)
         gpx_rot = st.sidebar.slider("GPS軌跡の回転角度", -180, 180, 0, step=1)
-        gpx_offset_x = st.sidebar.slider("左右移動 (X)", -2000, 2000, 0, step=5)
-        gpx_offset_y = st.sidebar.slider("上下移動 (Y)", -2000, 2000, 0, step=5)
+        gpx_offset_x = st.sidebar.slider("左右移動 (X)", -5000, 5000, 0, step=10)
+        gpx_offset_y = st.sidebar.slider("上下移動 (Y)", -5000, 5000, 0, step=10)
 
-    # 画質設定
     scale = 0.35
-
-    # キャッシュされた画像解析の呼び出し
     file_bytes = bytes(uploaded_file.read())
     (small_img, h_s, w_s, road_mask, attack_points, grad_x, grad_y, grad_mag, dist_capped, small_cost) = process_map_data(file_bytes, scale, slope_weight, nav_weight)
 
-    # デバッグUI
     st.sidebar.markdown("---")
     st.sidebar.subheader("AIの脳内マップ")
     display_cost = np.clip(small_cost, 0, 10)
     cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     st.sidebar.image(cost_visual, use_container_width=True)
 
-    # 経路探索アルゴリズム
     def dijkstra(cost_map, gx_mat, gy_mat, g_mag, c_weight, start, goal):
         h, w = cost_map.shape
         dist = np.full((h, w), np.inf)
@@ -247,7 +248,6 @@ if uploaded_file is not None:
         path.append(start)
         return path[::-1]
 
-    # クリックUI
     if 'start_nx' not in st.session_state:
         st.session_state.start_nx, st.session_state.start_ny = 0.53, 0.77
         st.session_state.goal_nx, st.session_state.goal_ny = 0.70, 0.50
@@ -292,7 +292,6 @@ if uploaded_file is not None:
 
     start, goal = (sy, sx), (gy, gx)
 
-    # 経路探索実行
     st.markdown("---")
     st.subheader("🗺️ 2. AIルート解析結果")
 
@@ -331,7 +330,6 @@ if uploaded_file is not None:
         if not routes:
             st.warning("⚠️ ルートが見つかりませんでした。")
         else:
-            # 元画像の復元と描画
             vis = cv2.imdecode(np.asarray(bytearray(file_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
             h_orig, w_orig = vis.shape[:2]
 
@@ -344,43 +342,46 @@ if uploaded_file is not None:
             if best_ap:
                 cv2.circle(vis, (int(best_ap[1] * scale_inv), int(best_ap[0] * scale_inv)), 15, (255, 255, 0), 4)
 
-            # --------------------------------------------------
-            # 🏃‍♂️ GPSデータの2D変換と描画（アフィン変換処理）
-            # --------------------------------------------------
-            if gpx_points:
-                lats = [p[0] for p in gpx_points]
-                lons = [p[1] for p in gpx_points]
-                mean_lat, mean_lon = np.mean(lats), np.mean(lons)
-                
-                gpx_pixels = []
-                for lat, lon in gpx_points:
-                    # 北緯38度付近の経度補正を掛けつつメートル単位の相対距離に変換
-                    dx = (lon - mean_lon) * np.cos(np.radians(38.0)) * 111000 * gpx_scale
-                    dy = -(lat - mean_lat) * 111000 * gpx_scale
-                    
-                    # 回転行列の適用
-                    rad = np.radians(gpx_rot)
-                    rx = dx * np.cos(rad) - dy * np.sin(rad)
-                    ry = dx * np.sin(rad) + dy * np.cos(rad)
-                    
-                    # 元画像上のピクセル座標を決定
-                    px = int(w_orig / 2 + rx + gpx_offset_x)
-                    py = int(h_orig / 2 + ry + gpx_offset_y)
-                    gpx_pixels.append((px, py))
-                
-                # 実際の軌跡を「鮮やかなオレンジ色」の二重線で描画
-                for i in range(len(gpx_pixels) - 1):
-                    pt1, pt2 = gpx_pixels[i], gpx_pixels[i+1]
-                    if (0 <= pt1[0] < w_orig and 0 <= pt1[1] < h_orig and 0 <= pt2[0] < w_orig and 0 <= pt2[1] < h_orig):
-                        cv2.line(vis, pt1, pt2, (0, 100, 255), thickness=6) # 縁取り
-                        cv2.line(vis, pt1, pt2, (0, 180, 255), thickness=3) # 中心線
+            # ★修正：GPSデータの正規化とスマートな描画
+            if gpx_segments:
+                all_lats = [p[0] for seg in gpx_segments for p in seg]
+                all_lons = [p[1] for seg in gpx_segments for p in seg]
+                min_lat, max_lat = min(all_lats), max(all_lats)
+                min_lon, max_lon = min(all_lons), max(all_lons)
+                center_lat = (min_lat + max_lat) / 2
+                center_lon = (min_lon + max_lon) / 2
+                lat_range = max_lat - min_lat if max_lat != min_lat else 1e-6
+                lon_range = max_lon - min_lon if max_lon != min_lon else 1e-6
 
-            # コントロール記号の描画
+                base_scale = min(w_orig, h_orig)
+
+                for seg in gpx_segments:
+                    gpx_pixels = []
+                    for lat, lon in seg:
+                        nx = (lon - center_lon) / lon_range
+                        ny = -(lat - center_lat) / lat_range
+                        
+                        dx = nx * base_scale * gpx_scale
+                        dy = ny * base_scale * gpx_scale
+                        
+                        rad = np.radians(gpx_rot)
+                        rx = dx * np.cos(rad) - dy * np.sin(rad)
+                        ry = dx * np.sin(rad) + dy * np.cos(rad)
+                        
+                        px = int(w_orig / 2 + rx + gpx_offset_x)
+                        py = int(h_orig / 2 + ry + gpx_offset_y)
+                        gpx_pixels.append((px, py))
+                    
+                    for i in range(len(gpx_pixels) - 1):
+                        pt1, pt2 = gpx_pixels[i], gpx_pixels[i+1]
+                        if (0 <= pt1[0] < w_orig and 0 <= pt1[1] < h_orig and 0 <= pt2[0] < w_orig and 0 <= pt2[1] < h_orig):
+                            cv2.line(vis, pt1, pt2, (0, 100, 255), thickness=6)
+                            cv2.line(vis, pt1, pt2, (0, 180, 255), thickness=3)
+
             cv2.circle(vis, orig_start, 30, (255, 0, 255), 5)
             cv2.circle(vis, orig_goal, 30, (255, 0, 255), 5)
             cv2.circle(vis, orig_goal, 18, (255, 0, 255), 3)
 
-            # AIルートの描画
             for i in reversed(range(len(routes))):
                 color = colors[i]
                 for j in range(len(routes[i]) - 1):
@@ -390,25 +391,24 @@ if uploaded_file is not None:
 
             st.image(vis, channels="BGR", caption="赤:最適解 / 青:AP経由 / 緑:大穴 / オレンジ:あなたのGPS実走ログ", use_container_width=True)
             
-            # パフォーマンスダッシュボードの出力
             st.subheader("📊 ルートごとのパフォーマンス比較")
             
-            # GPSログがある場合はカラムを1つ増やして実走データを並べる
-            num_cols = len(metrics) + (1 if gpx_points else 0)
+            num_cols = len(metrics) + (1 if gpx_segments else 0)
             cols = st.columns(num_cols)
             
             for i, col in enumerate(cols[:len(metrics)]):
                 with col:
-                    st.markdown(f"**{metrics[i]['color']} : {metrics[i]['名前']}**")
+                    # ★修正：'color' を '色' に戻しました
+                    st.markdown(f"**{metrics[i]['色']} : {metrics[i]['名前']}**")
                     st.metric(label="難易度スコア (推定タイム)", value=metrics[i]["難易度スコア"])
                     st.metric(label="移動距離 (ピクセル)", value=metrics[i]["距離"])
             
-            if gpx_points:
+            if gpx_segments:
                 with cols[-1]:
                     st.markdown("**🏃‍♂️ オレンジ : あなたのGPS実走**")
                     st.metric(label="実走行距離", value=f"{round(total_gpx_dist, 2)} km")
-                    st.metric(label="ログのデータ点数", value=f"{len(gpx_points)} pt")
-                    st.caption("※サイドバーの『左右移動』『上下移動』『拡大率』を使って、軌跡を地図の道に重ね合わせてください。")
+                    st.metric(label="ログのデータ点数", value=f"{total_pts} pt")
+                    st.caption("※サイドバーを使って、軌跡を地図の道に重ね合わせてください。")
 
 else:
     st.info("上のボックスから地図画像をアップロードすると自動的に解析が始まります。")
