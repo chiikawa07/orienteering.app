@@ -6,7 +6,7 @@ import streamlit as st
 # ==========================================
 # UI: タイトルとアップローダー
 # ==========================================
-st.title("オリエンテーリングAI (沢またぎ・方向考慮版)")
+st.title("オリエンテーリングAI (ナビゲーション考慮版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -90,41 +90,51 @@ if uploaded_file is not None:
             cv2.drawContours(road_mask, [cnt], -1, 255, -1)
 
     # =========================
-    # ⑤ 地形コスト設定 & 【新規】等高線勾配ベクトルの計算
+    # ⑤ 地形コスト設定 & 勾配ベクトル & 【新規】ナビゲーションペナルティ
     # =========================
     st.sidebar.markdown("---")
     st.sidebar.subheader("⛰️ アップダウン・沢またぎの回避設定")
     slope_weight = st.sidebar.slider("斜度の基本ペナルティ (全体の回避度)", 0.0, 50.0, 20.0, step=2.0)
     cross_weight = st.sidebar.slider("等高線を横切る移動へのペナルティ (沢またぎ防止)", 0.0, 100.0, 50.0, step=5.0)
 
-    # Sobelフィルタで等高線の法線ベクトル（勾配）を解析
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧭 ナビゲーション難易度の設定")
+    st.sidebar.write("数値を上げると、現在地を見失わないよう道や小径（ハンドレール）の近くを好んで走るようになります。")
+    nav_weight = st.sidebar.slider("道から離れることへの不安度 (ペナルティ)", 0.0, 10.0, 3.0, step=0.5)
+
+    # (A) 勾配と密集度ペナルティの計算
     brown_blur = cv2.GaussianBlur(mask_brown, (5, 5), 0)
     grad_x = cv2.Sobel(brown_blur, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(brown_blur, cv2.CV_32F, 0, 1, ksize=3)
     grad_mag = cv2.magnitude(grad_x, grad_y)
-    
-    # ベクトルを単位化（ゼロ除算防止）
     grad_x = np.where(grad_mag > 0, grad_x / grad_mag, 0.0)
     grad_y = np.where(grad_mag > 0, grad_y / grad_mag, 0.0)
-
-    # 従来の密集度ヒートマップ
     slope_heatmap = cv2.GaussianBlur(mask_brown, (21, 21), 0)
     slope_penalty = (slope_heatmap / 255.0) * slope_weight
 
-    # 基本コストマップ
+    # (B) 【新規】ナビゲーションペナルティの計算（距離変換）
+    # 道マスクを反転（道=0, それ以外=255）させて距離を測る
+    inv_road = cv2.bitwise_not(road_mask)
+    dist_to_road = cv2.distanceTransform(inv_road, cv2.DIST_L2, 5)
+    # 最大50ピクセル離れたところで不安度はピーク（頭打ち）とする
+    dist_capped = np.clip(dist_to_road, 0, 50)
+    nav_penalty = (dist_capped / 50.0) * nav_weight
+
+    # (C) 基本コストマップの合成
     small_cost = np.full((h_s, w_s), 5.0)
     small_cost[mask_white > 0] = 1.0
     small_cost[mask_yellow > 0] = 0.8
     small_cost[mask_brown > 0] = 1.2
     small_cost[mask_green > 0] = 3.0
     small_cost[road_mask > 0] = 0.5
+    
+    # ペナルティをすべて上乗せ！
+    small_cost = small_cost + slope_penalty + nav_penalty
+
+    # 絶対障害物の適用（上乗せ後に適用して壁を維持する）
     small_cost[wall_mask > 0] = 9999
     small_cost[mask_blue > 0] = 9999
 
-    # 密集度ペナルティのみベースマップに加算
-    small_cost = small_cost + slope_penalty
-
-    # 余白のズル防止壁
     margin = 15
     small_cost[0:margin, :] = 9999
     small_cost[-margin:, :] = 9999
@@ -140,8 +150,16 @@ if uploaded_file is not None:
     cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
 
+    with st.sidebar.expander("🔍 AIの空間認識テスト"):
+        # 距離変換マップをカラー化して表示
+        dist_color = cv2.normalize(dist_capped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        dist_color = cv2.applyColorMap(dist_color, cv2.COLORMAP_JET)
+        st.image(dist_color, caption="🗺️ ナビゲーション不安度 (赤＝道から遠い危険地帯 / 青＝道の近くで安心)", use_container_width=True)
+        st.image(slope_heatmap, caption="🔥 急斜面ヒートマップ", use_container_width=True)
+        st.image(road_mask, caption="黒（道・小径と認識した場所）", use_container_width=True)
+
     # =========================
-    # ⑦ 【修正】経路探索（異方性コスト対応ダイクストラ法）
+    # ⑦ 経路探索（異方性コスト対応ダイクストラ法）
     # =========================
     def dijkstra(cost_map, gx_mat, gy_mat, g_mag, c_weight, start, goal):
         h, w = cost_map.shape
@@ -149,8 +167,6 @@ if uploaded_file is not None:
         prev = np.full((h, w, 2), -1)
         dist[start] = 0
         pq = [(0, start)]
-        
-        # 8方向への移動ベクトル
         directions = [(-1,0),(1,0),(0,-1),(0,1), (-1,-1),(-1,1),(1,-1),(1,1)]
 
         while pq:
@@ -164,20 +180,12 @@ if uploaded_file is not None:
                         continue
                         
                     move_weight = 1.414 if (dy != 0 and dx != 0) else 1.0
-                    
-                    # 基礎地形コスト
                     base_step_cost = cost_map[ny,nx]
                     
-                    # ★方向依存ペナルティの動的計算
-                    if g_mag[ny, nx] > 10: # 等高線が存在する領域のみ
-                        # 移動方向ベクトルの正規化
+                    if g_mag[ny, nx] > 10:
                         move_len = np.sqrt(dy**2 + dx**2)
                         mdy, mdx = dy / move_len, dx / move_len
-                        
-                        # 移動ベクトルと等高線勾配ベクトルの内積（ドット積）
                         dot_product = abs(mdy * gy_mat[ny, nx] + mdx * gx_mat[ny, nx])
-                        
-                        # 内積が1に近い（直角に横切る）ほど大きなペナルティを加算
                         direction_penalty = dot_product * c_weight
                         base_step_cost += direction_penalty
 
@@ -215,7 +223,7 @@ if uploaded_file is not None:
     if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
         st.error("⚠️ スタートまたはゴールが通行不可エリアです。スライダーをずらしてください。")
     else:
-        with st.spinner('AIが方向特性と沢の横断を評価して複数ルートを探索中...'):
+        with st.spinner('AIが「ナビのしやすさ」と「地形」を総合評価して探索中...'):
             routes = []
             metrics = []
             colors = [(0, 0, 255), (255, 0, 0), (0, 128, 0)]
@@ -223,7 +231,6 @@ if uploaded_file is not None:
             
             search_cost = small_cost.copy()
             for i in range(3):
-                # 新しい引数（勾配情報とウェイト）をダイクストラに渡す
                 path = dijkstra(search_cost, grad_x, grad_y, grad_mag, cross_weight, start, goal)
                 if not path or len(path) <= 1:
                     break
@@ -239,7 +246,6 @@ if uploaded_file is not None:
                     "相対距離": route_dist
                 })
                 
-                # ペナルティ付与
                 for p in path:
                     y, x = p
                     y_min, y_max = max(0, y-4), min(h_s, y+5)
