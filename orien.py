@@ -8,7 +8,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # UI: タイトルとページ設定
 # ==========================================
 st.set_page_config(layout="wide") # 地図を大きく見せるためにワイド表示
-st.title("オリエンテーリングAI (クリック座標指定版)")
+st.title("オリエンテーリングAI (クリック＆ワイド表示版)")
 uploaded_file = st.file_uploader("地図画像（PNG等）を選択してください", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
@@ -146,7 +146,26 @@ if uploaded_file is not None:
     small_cost[:, -margin:] = 9999
 
     # =========================
-    # ⑦ 経路探索（異方性コスト対応ダイクストラ法）
+    # ⑦ デバッグUI表示
+    # =========================
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("AIの脳内マップ")
+    display_cost = np.clip(small_cost, 0, 10)
+    cost_visual = cv2.normalize(display_cost, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    st.sidebar.image(cost_visual, caption="黒＝速い / 白＝遅い・壁", use_container_width=True)
+
+    with st.sidebar.expander("🔍 AIの空間認識テスト"):
+        ap_vis = cv2.cvtColor(road_mask, cv2.COLOR_GRAY2BGR)
+        for ap in attack_points:
+            cv2.circle(ap_vis, (ap[1], ap[0]), 3, (0, 255, 255), -1)
+        st.image(ap_vis, caption="📍 抽出されたアタックポイント候補", use_container_width=True)
+        
+        dist_color = cv2.normalize(dist_capped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        dist_color = cv2.applyColorMap(dist_color, cv2.COLORMAP_JET)
+        st.image(dist_color, caption="🗺️ ナビ不安度", use_container_width=True)
+
+    # =========================
+    # ⑧ 経路探索（異方性コスト対応ダイクストラ法）
     # =========================
     def dijkstra(cost_map, gx_mat, gy_mat, g_mag, c_weight, start, goal):
         h, w = cost_map.shape
@@ -193,9 +212,8 @@ if uploaded_file is not None:
         return path[::-1]
 
     # =========================
-    # ⑧ 【NEW】直感的なクリックUIの実装
+    # ⑨ 【修正】大画面フルサイズのクリックUI
     # =========================
-    # クリック情報を保持するためのセッションステートを準備
     if 'start_y' not in st.session_state:
         st.session_state.start_y = int(h_s * 0.77)
         st.session_state.start_x = int(w_s * 0.53)
@@ -205,34 +223,26 @@ if uploaded_file is not None:
         st.session_state.last_click = None
 
     st.markdown("---")
-    st.subheader("📍 スタートとゴールを地図上でクリックして設定")
+    st.subheader("📍 1. ルートを設定する (地図をクリック)")
     
-    col_ui, col_map = st.columns([1, 2])
+    # ラジオボタンを横並び（horizontal=True）にしてスッキリさせる
+    point_type = st.radio("クリックで動かすポイントを選択:", ["🔵 スタート", "🔴 ゴール"], horizontal=True)
     
-    with col_ui:
-        st.info("設定したい地点を選択し、右の地図をクリックしてください。")
-        point_type = st.radio("クリックで動かすポイント:", ["🔵 スタート", "🔴 ゴール"])
+    # クリック用の画像を作成
+    click_map_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
     
-    with col_map:
-        # クリック用の画像を作成（現在の位置を紫色のマーカーで描画）
-        click_map_img = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
-        
-        # スタートの描画 (S)
-        cv2.circle(click_map_img, (st.session_state.start_x, st.session_state.start_y), 6, (255, 0, 255), -1)
-        cv2.putText(click_map_img, "S", (st.session_state.start_x + 8, st.session_state.start_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-        
-        # ゴールの描画 (G - 二重丸)
-        cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 6, (255, 0, 255), 2)
-        cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 2, (255, 0, 255), -1)
-        cv2.putText(click_map_img, "G", (st.session_state.goal_x + 8, st.session_state.goal_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-        
-        # 画像上でクリックイベントを取得
-        click_val = streamlit_image_coordinates(click_map_img, key="map_click")
+    # スタートとゴールの描画
+    cv2.circle(click_map_img, (st.session_state.start_x, st.session_state.start_y), 6, (255, 0, 255), -1)
+    cv2.putText(click_map_img, "S", (st.session_state.start_x + 8, st.session_state.start_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+    cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 6, (255, 0, 255), 2)
+    cv2.circle(click_map_img, (st.session_state.goal_x, st.session_state.goal_y), 2, (255, 0, 255), -1)
+    cv2.putText(click_map_img, "G", (st.session_state.goal_x + 8, st.session_state.goal_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+    
+    # 【最重要】use_column_width=True を指定して、はみ出しを防ぎつつ画面横幅いっぱいに広げる！
+    click_val = streamlit_image_coordinates(click_map_img, key="map_click", use_column_width=True)
 
-    # 新しい場所がクリックされたら座標を更新
     if click_val is not None and click_val != st.session_state.last_click:
         st.session_state.last_click = click_val
-        # 余白の壁(margin)をクリックしてエラーにならないよう、座標を安全な範囲に制限
         safe_x = max(margin, min(click_val['x'], w_s - margin - 1))
         safe_y = max(margin, min(click_val['y'], h_s - margin - 1))
         
@@ -242,16 +252,17 @@ if uploaded_file is not None:
         else:
             st.session_state.goal_x = safe_x
             st.session_state.goal_y = safe_y
-        
-        # 画面を即座に再描画して変更を反映
         st.rerun()
 
     start = (st.session_state.start_y, st.session_state.start_x)
     goal = (st.session_state.goal_y, st.session_state.goal_x)
 
     # =========================
-    # ⑨ 経路探索実行
+    # ⑩ 経路探索実行
     # =========================
+    st.markdown("---")
+    st.subheader("🗺️ 2. AIルート解析結果")
+
     if small_cost[start] >= 9999 or small_cost[goal] >= 9999:
         st.error("⚠️ スタートまたはゴールが通行不可エリアです。別の場所をクリックしてください。")
     else:
@@ -309,7 +320,7 @@ if uploaded_file is not None:
             st.warning("⚠️ ルートが見つかりませんでした。")
         else:
             # =========================
-            # ⑩ 可視化とダッシュボード
+            # ⑪ 可視化とダッシュボード
             # =========================
             vis = img.copy()
             scale_inv = int(1 / scale)
@@ -338,7 +349,6 @@ if uploaded_file is not None:
                     pt2 = (path[j+1][1] * scale_inv, path[j+1][0] * scale_inv)
                     cv2.line(vis, pt1, pt2, color, thickness=4)
 
-            st.subheader("🗺️ AIルート解析結果")
             st.image(vis, channels="BGR", caption="赤:最適解 / 青:AP経由(人間的) / 緑:大穴", use_container_width=True)
             
             st.subheader("📊 ルートごとのパフォーマンス比較")
