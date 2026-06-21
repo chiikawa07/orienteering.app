@@ -117,6 +117,34 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
             if dist < min_dist: min_dist, closest = dist, name
         masks[closest][labels_reshaped == i] = 255
 
+    # ★IMPROVED: k-meansは画像によって6クラスタに上手く色を分離できず、
+    # 「green」や「blue」などの色が1クラスタも割り当てられず0画素になることがある
+    # （地図全体が暗く写っている・配色が複雑な場合などに起きやすい）。
+    # これが起きると、本来「色のついた地図要素」である森や湖が
+    # 誤って「white(未踏査エリア)」とみなされ、後段の余白トリミングの
+    # 判定基盤(mask_white)が大きく狂ってしまう。
+    #
+    # 対策として、k-meansの結果に関係なく、HSV値から直接「白地(走行良好,
+    # 明度が高く彩度が低い)」を判定するロバストなマスクを作り、
+    # 両者の OR ではなく AND (両方が白と判定した場合のみ白とみなす) を取って
+    # mask_white を補正する。AND にすることで、k-meansが森や山を
+    # 間違って white クラスタに入れてしまった場合でも、HSV的に明らかに
+    # 彩度がある(=白ではない)ピクセルは white から除外できる。
+    hsv_v = hsv[:, :, 2]
+    hsv_s = hsv[:, :, 1]
+    robust_white = ((hsv_v > 170) & (hsv_s < 50)).astype(np.uint8) * 255
+
+    if cv2.countNonZero(masks["white"]) == 0:
+        # k-meansがwhiteクラスタを全く割り当てなかった極端なケース。
+        # ロバスト判定(HSV直接判定)の結果をそのまま採用する。
+        masks["white"] = robust_white
+    else:
+        # 通常ケース: k-meansの判定とHSV直接判定の AND を取る。
+        # これにより、k-meansが森や山などの色のある領域を誤って
+        # whiteクラスタに含めてしまっていた場合でも、HSV的に
+        # 明らかに彩度がある画素は white から除外できる。
+        masks["white"] = cv2.bitwise_and(masks["white"], robust_white)
+
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask_black_closed = cv2.morphologyEx(masks["black"], cv2.MORPH_CLOSE, kernel_close)
     road_mask = np.zeros_like(masks["black"])
@@ -139,8 +167,13 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     # 競技エリアを確定する。見つからない場合は従来のモルフォロジー
     # ベースの自動トリミングにフォールバックする。
     # ==========================================
+    # 「地図に必須の要素」マスク(等高線=brown, 道や記号=black, 開けた地=yellow,
+    # 藪=green, 水域=blue)。白(white)は「走行良好エリア」と「単なる紙の余白」の
+    # 両方を含み区別できないため、地図本体かどうかの判定には使わない。
+    map_elements_mask = masks["brown"] | masks["black"] | masks["yellow"] | masks["green"] | masks["blue"]
+
     map_blob_filled, used_magenta_boundary = build_competition_area_mask(
-        masks["white"], mask_magenta, h_s, w_s
+        masks["white"], mask_magenta, h_s, w_s, map_elements_mask=map_elements_mask
     )
 
     brown_blur = cv2.GaussianBlur(masks["brown"], (5, 5), 0)
@@ -184,7 +217,7 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
             map_blob_filled, used_magenta_boundary, magenta_pixel_count, road_priority_cost)
 
 
-def build_competition_area_mask(mask_white, mask_magenta, h_s, w_s, edge_margin_ratio=0.02):
+def build_competition_area_mask(mask_white, mask_magenta, h_s, w_s, edge_margin_ratio=0.02, map_elements_mask=None):
     """
     競技エリア（進入可能領域）のマスクを作る。
     優先順位:
@@ -300,26 +333,19 @@ def build_competition_area_mask(mask_white, mask_magenta, h_s, w_s, edge_margin_
     # 小さい色塊」が、強い膨張処理によって地図本体と1つに繋がってしまい、
     # 結果的に地図外の余白まで「進入可能」と誤判定される問題への対策。
     #
-    # 対策: 膨張前に、まず「白以外の塊」を連結成分ごとに分け、
+    # 対策1: 膨張前に、まず「白以外の塊」を連結成分ごとに分け、
     # 画像全体に対して十分な大きさを持つ成分だけを残す。
-    # タイトル文字やテーブルは小さい連結成分の集まりになりやすいため、
-    # ここで除去しておけば、後の膨張で地図本体に誤って吸着されない。
     non_white = cv2.bitwise_not(mask_white)
 
     total_pixels = h_s * w_s
     num_labels, labels_cc, stats, _ = cv2.connectedComponentsWithStats(non_white, connectivity=8)
     non_white_filtered = np.zeros_like(non_white)
-    # 小さい連結成分(全体の0.3%未満)は文字やノイズとみなして除去する。
-    # 地図本体は通常、画像の大部分を占める巨大な連結成分になるため、
-    # この閾値で文字列やアイコンなどの小片だけを狙って取り除ける。
     min_component_area = total_pixels * 0.003
     for label_id in range(1, num_labels):  # 0は背景なのでスキップ
         area = stats[label_id, cv2.CC_STAT_AREA]
         if area >= min_component_area:
             non_white_filtered[labels_cc == label_id] = 255
 
-    # フィルタ後に何も残らなかった場合（閾値が厳しすぎた等）は、
-    # 安全のため元のmaskにフォールバックする
     if cv2.countNonZero(non_white_filtered) == 0:
         non_white_filtered = non_white
 
@@ -335,6 +361,29 @@ def build_competition_area_mask(mask_white, mask_magenta, h_s, w_s, edge_margin_
         cv2.drawContours(map_blob_filled, [largest_cnt], -1, 255, -1)
     else:
         map_blob_filled.fill(255)
+
+    # 対策2: whiteマスク自体が「地図内の走行良好エリア」と「単なる紙の余白」を
+    # 区別できないため、上記までの処理だけでは、タイトル文字付近の空白などが
+    # 地図本体と地続きに見えて誤って取り込まれることがある。
+    # そこで、「地図に必須の要素(等高線・道・記号・藪・水域)」の密度が
+    # 極端に低い領域は、たとえ上記で進入可能と判定されていても除外する。
+    # これにより、文字だけがポツポツあるだけの余白(密度が低い)は
+    # 取り除きつつ、白地が多くても等高線が密に描かれた地図本体は残せる。
+    if map_elements_mask is not None and cv2.countNonZero(map_elements_mask) > 0:
+        density = cv2.GaussianBlur(map_elements_mask, (25, 25), 0)
+        # 密度が低すぎる(地図要素がほとんど無い)領域を除外。
+        # 閾値は緩めに設定し、地図本体の白地が広いエリア(例:开けた草地)を
+        # 誤って削らないようにする。
+        density_ok = (density > 8).astype(np.uint8) * 255
+        density_ok_dilated = cv2.dilate(
+            density_ok, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)), iterations=1
+        )
+        candidate = cv2.bitwise_and(map_blob_filled, density_ok_dilated)
+        # 密度フィルタ適用後に十分な面積が残っていれば採用する。
+        # 残りすぎ少ない場合は、フィルタが効きすぎた可能性があるため
+        # 適用前の結果を使う（安全側に倒す）。
+        if cv2.countNonZero(candidate) > total_pixels * 0.05:
+            map_blob_filled = candidate
 
     map_blob_filled = apply_edge_margin(map_blob_filled)
 
@@ -503,12 +552,21 @@ if uploaded_file is not None:
                 if used_magenta_boundary:
                     st.success(f"✅ 紫線（No mapping境界）を検出し、競技エリアを確定しました。（検出ピクセル数: {magenta_pixel_count}）")
                 else:
-                    st.info(f"自動トリミング適用中（紫線が見つからないため、色領域から推定しています）")
+                    st.warning(
+                        "⚠️ 紫線が見つからないため、色領域から推定しています。\n\n"
+                        "この方法は地図の配色によって誤判定が起きやすく、"
+                        "森や山が「進入禁止」、タイトル文字や余白が「進入可能」と"
+                        "逆に判定されることがあります。\n\n"
+                        "**右側の地図でグレーアウトの範囲が不自然な場合は、"
+                        "このチェックボックスを外して、下の「上下左右のカット(%)」で"
+                        "手動調整することを強くおすすめします。**"
+                    )
                     if magenta_pixel_count > 0:
-                        st.caption(f"⚠️ 紫色の画素は{magenta_pixel_count}個検出されましたが、閉じた境界として認識できませんでした（線が薄い・途切れすぎている可能性があります）。")
+                        st.caption(f"（紫色の画素は{magenta_pixel_count}個検出されましたが、閉じた境界として認識できませんでした）")
                     else:
-                        st.caption("⚠️ 紫色の画素が全く検出されませんでした。地図の色設定が標準と異なるかもしれません。")
+                        st.caption("（紫色の画素が全く検出されませんでした）")
             else:
+                st.caption("👇 スライダーで地図の不要な余白（タイトル・凡例など）を手動で除外できます。")
                 crop_top = st.slider("上部のカット (%)", 0, 50, 0)
                 crop_bottom = st.slider("下部のカット (%)", 0, 50, 0)
                 crop_left = st.slider("左側のカット (%)", 0, 50, 0)
