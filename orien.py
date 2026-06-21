@@ -482,20 +482,40 @@ def get_straight_line_path(cost_map, start, goal):
     return points
 
 
-def pick_diverse_attack_points(attack_points, goal, start, cost_map, top_n=3, min_separation=30):
+def pick_diverse_attack_points(attack_points, goal, start, cost_map, top_n=3, min_separation=30, max_detour_ratio=1.4):
     """
     ゴール付近のコーナー検出点(attack_points)の中から、ゴールに近く、
     かつスタートから見て互いに離れた(=似たルートにならない)候補を複数選ぶ。
 
     単純に「ゴールに最も近い1点」だけを選ぶと、最適解とほぼ同じルートに
     なりがちなため、複数の異なるアプローチ方向を比較できるようにする。
+
+    ★IMPROVED: 「ゴールに近いだけ」のAPは、スタートから見て全く逆方向や
+    大きく迂回する位置にあっても選ばれてしまい、実用的でない非効率なルートに
+    なりやすかった。そこで、「スタート→AP→ゴール」の直線距離の合計が、
+    「スタート→ゴール」の直線距離の何倍になるか(迂回率)を計算し、
+    max_detour_ratio を超える(=明らかに遠回りな)APは候補から除外する。
     """
     if not attack_points:
         return []
 
-    # ゴールに近い順に並べ、進入禁止地点は除外
-    candidates = [p for p in attack_points if cost_map[p] < 9999]
-    candidates.sort(key=lambda p: np.hypot(p[0] - goal[0], p[1] - goal[1]))
+    direct_dist = np.hypot(start[0] - goal[0], start[1] - goal[1])
+    if direct_dist < 1e-6:
+        direct_dist = 1.0  # スタートとゴールが同一点の場合の保護
+
+    # ゴールに近い順に並べ、進入禁止地点・極端な迂回になる地点は除外
+    candidates = []
+    for p in attack_points:
+        if cost_map[p] >= 9999:
+            continue
+        dist_to_goal = np.hypot(p[0] - goal[0], p[1] - goal[1])
+        dist_from_start = np.hypot(p[0] - start[0], p[1] - start[1])
+        detour_ratio = (dist_from_start + dist_to_goal) / direct_dist
+        if detour_ratio <= max_detour_ratio:
+            candidates.append((p, dist_to_goal))
+
+    candidates.sort(key=lambda item: item[1])
+    candidates = [p for p, _ in candidates]
 
     selected = []
     for p in candidates:
@@ -677,18 +697,31 @@ if uploaded_file is not None:
         ap_emojis = ["🔵 青", "🟠 橙", "🟣 紫"]
 
         existing_paths_for_dedup = [r[0] for r in routes]
+        optimal_score = (
+            sum(small_cost[p[0], p[1]] for p in path1) if path1 and len(path1) > 1 else None
+        )
+        max_acceptable_score = optimal_score * 1.6 if optimal_score else None
+
         for idx, ap in enumerate(diverse_aps):
             try:
                 path_to_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, ap)
                 path_from_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, ap, goal)
                 if path_to_ap and path_from_ap:
                     ap_path = path_to_ap[:-1] + path_from_ap
+                    ap_score = round(sum(small_cost[p[0], p[1]] for p in ap_path), 1)
+
+                    # ★NEW: 最適解と比べて明らかに非効率(コストが1.6倍超)な
+                    # ルートは「使い物にならない迂回」とみなして表示しない。
+                    # APの選定段階(迂回率フィルタ)だけでは、Dijkstra後の
+                    # 実際の通行コストまでは保証できないため、ここで最終チェックする。
+                    if max_acceptable_score is not None and ap_score > max_acceptable_score:
+                        continue
+
                     # 既に表示する予定の他ルートとほぼ重複していたらスキップ
                     if any(paths_are_similar(ap_path, existing) for existing in existing_paths_for_dedup):
                         continue
                     routes.append((ap_path, ap_colors[idx % len(ap_colors)], "実線"))
                     existing_paths_for_dedup.append(ap_path)
-                    ap_score = round(sum(small_cost[p[0], p[1]] for p in ap_path), 1)
                     metrics.append({"名前": ap_labels[idx], "色": ap_emojis[idx], "スコア": ap_score})
             except Exception as e:
                 st.warning(f"アタックポイント経由ルート({ap_labels[idx]})の計算でエラーが発生しました: {e}")
