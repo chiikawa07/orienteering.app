@@ -164,9 +164,24 @@ def process_map_data(file_bytes, scale, slope_weight, nav_weight):
     small_cost[masks["blue"] > 0] = 9999
     small_cost[mask_magenta_wall > 0] = 9999
 
+    # ★NEW: 「道優先（歩きやすさ重視）」専用コストマップ。
+    # 道路・通行良好地はさらに割安に、藪(green)・急斜面はさらに割高にして、
+    # 多少遠回りでも歩きやすい場所を通るルートを誘導する。
+    road_priority_cost = np.full((h_s, w_s), 5.0)
+    road_priority_cost[masks["white"] > 0] = 1.0
+    road_priority_cost[masks["yellow"] > 0] = 0.6
+    road_priority_cost[masks["brown"] > 0] = 1.0
+    road_priority_cost[masks["green"] > 0] = 6.0   # 藪はより嫌う
+    road_priority_cost[road_mask > 0] = 0.2        # 道はより好む
+    road_priority_cost = road_priority_cost + slope_penalty * 1.5 + nav_penalty * 0.5
+    road_priority_cost[wall_mask > 0] = 9999
+    road_priority_cost[masks["blue"] > 0] = 9999
+    road_priority_cost[mask_magenta_wall > 0] = 9999
+
     magenta_pixel_count = int(cv2.countNonZero(mask_magenta))
 
-    return h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled, used_magenta_boundary, magenta_pixel_count
+    return (h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost,
+            map_blob_filled, used_magenta_boundary, magenta_pixel_count, road_priority_cost)
 
 
 def build_competition_area_mask(mask_white, mask_magenta, h_s, w_s, edge_margin_ratio=0.02):
@@ -281,9 +296,35 @@ def build_competition_area_mask(mask_white, mask_magenta, h_s, w_s, edge_margin_
                     return area_mask, True
 
     # --- 2. フォールバック: 従来のモルフォロジーベースの推定 ---
+    # ★IMPROVED: タイトル文字・コース情報・凡例などの「地図本体から離れた
+    # 小さい色塊」が、強い膨張処理によって地図本体と1つに繋がってしまい、
+    # 結果的に地図外の余白まで「進入可能」と誤判定される問題への対策。
+    #
+    # 対策: 膨張前に、まず「白以外の塊」を連結成分ごとに分け、
+    # 画像全体に対して十分な大きさを持つ成分だけを残す。
+    # タイトル文字やテーブルは小さい連結成分の集まりになりやすいため、
+    # ここで除去しておけば、後の膨張で地図本体に誤って吸着されない。
     non_white = cv2.bitwise_not(mask_white)
+
+    total_pixels = h_s * w_s
+    num_labels, labels_cc, stats, _ = cv2.connectedComponentsWithStats(non_white, connectivity=8)
+    non_white_filtered = np.zeros_like(non_white)
+    # 小さい連結成分(全体の0.3%未満)は文字やノイズとみなして除去する。
+    # 地図本体は通常、画像の大部分を占める巨大な連結成分になるため、
+    # この閾値で文字列やアイコンなどの小片だけを狙って取り除ける。
+    min_component_area = total_pixels * 0.003
+    for label_id in range(1, num_labels):  # 0は背景なのでスキップ
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area >= min_component_area:
+            non_white_filtered[labels_cc == label_id] = 255
+
+    # フィルタ後に何も残らなかった場合（閾値が厳しすぎた等）は、
+    # 安全のため元のmaskにフォールバックする
+    if cv2.countNonZero(non_white_filtered) == 0:
+        non_white_filtered = non_white
+
     kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    eroded = cv2.erode(non_white, kernel_erode)
+    eroded = cv2.erode(non_white_filtered, kernel_erode)
     kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41))
     map_blob = cv2.dilate(eroded, kernel_dilate)
 
@@ -366,6 +407,58 @@ def snap_to_valid(pt, cost_map, max_r=150):
 
     return pt
 
+
+def get_straight_line_path(cost_map, start, goal):
+    """
+    start から goal までの直線（Bresenhamのアルゴリズム）が通るセルを列挙する。
+    「もし道を無視して真っ直ぐ突っ切ったらどうなるか」の基準ルートとして使う。
+    壁(9999)を通っても経路としては成立させ、コスト計算側でその高さが分かるようにする。
+    """
+    y0, x0 = start
+    y1, x1 = goal
+    points = []
+
+    dx = x1 - x0
+    dy = y1 - y0
+    steps = max(abs(dx), abs(dy))
+    if steps == 0:
+        return [start]
+
+    for i in range(steps + 1):
+        t = i / steps
+        y = int(round(y0 + dy * t))
+        x = int(round(x0 + dx * t))
+        points.append((y, x))
+
+    return points
+
+
+def pick_diverse_attack_points(attack_points, goal, start, cost_map, top_n=3, min_separation=30):
+    """
+    ゴール付近のコーナー検出点(attack_points)の中から、ゴールに近く、
+    かつスタートから見て互いに離れた(=似たルートにならない)候補を複数選ぶ。
+
+    単純に「ゴールに最も近い1点」だけを選ぶと、最適解とほぼ同じルートに
+    なりがちなため、複数の異なるアプローチ方向を比較できるようにする。
+    """
+    if not attack_points:
+        return []
+
+    # ゴールに近い順に並べ、進入禁止地点は除外
+    candidates = [p for p in attack_points if cost_map[p] < 9999]
+    candidates.sort(key=lambda p: np.hypot(p[0] - goal[0], p[1] - goal[1]))
+
+    selected = []
+    for p in candidates:
+        if len(selected) >= top_n:
+            break
+        # 既に選んだ点との距離が min_separation 未満なら「似たルート」とみなしスキップ
+        too_close = any(np.hypot(p[0] - s[0], p[1] - s[1]) < min_separation for s in selected)
+        if not too_close:
+            selected.append(p)
+
+    return selected
+
 # ==========================================
 # セッション初期化
 # ==========================================
@@ -397,7 +490,7 @@ if uploaded_file is not None:
 
     scale = 0.35
     file_bytes = bytes(uploaded_file.read())
-    (h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled, used_magenta_boundary, magenta_pixel_count) = process_map_data(file_bytes, scale, 20.0, 3.0)
+    (h_s, w_s, attack_points, grad_x, grad_y, grad_mag, small_cost, map_blob_filled, used_magenta_boundary, magenta_pixel_count, road_priority_cost) = process_map_data(file_bytes, scale, 20.0, 3.0)
 
     with col_panel:
         point_type = st.radio("📌 地図をクリックして移動:", ["🔵 スタート", "🔴 ゴール"])
@@ -428,8 +521,10 @@ if uploaded_file is not None:
             st.session_state.goal_ny = st.slider("ゴールの縦位置 (Y)", 0.0, 1.0, value=float(st.session_state.goal_ny), step=0.01)
 
     search_cost = small_cost.copy()
+    road_search_cost = road_priority_cost.copy()
     if use_auto_crop:
         search_cost[map_blob_filled == 0] = 9999
+        road_search_cost[map_blob_filled == 0] = 9999
     else:
         t_m = int(h_s * (crop_top / 100))
         b_m = int(h_s * (1 - crop_bottom / 100))
@@ -439,6 +534,10 @@ if uploaded_file is not None:
         search_cost[b_m:h_s, :] = 9999
         search_cost[:, 0:l_m] = 9999
         search_cost[:, r_m:w_s] = 9999
+        road_search_cost[0:t_m, :] = 9999
+        road_search_cost[b_m:h_s, :] = 9999
+        road_search_cost[:, 0:l_m] = 9999
+        road_search_cost[:, r_m:w_s] = 9999
 
     sx = max(0, min(int(st.session_state.start_nx * w_s), w_s - 1))
     sy = max(0, min(int(st.session_state.start_ny * h_s), h_s - 1))
@@ -449,22 +548,95 @@ if uploaded_file is not None:
     goal = snap_to_valid((gy, gx), search_cost)
 
     routes, metrics = [], []
+
+    def paths_are_similar(path_a, path_b, threshold_ratio=0.85):
+        """
+        2つのパスがどれだけ重なっているかを、一定間隔でサンプリングした点同士の
+        距離で簡易判定する。重なりが threshold_ratio 以上なら「似たルート」とみなす。
+        """
+        if not path_a or not path_b:
+            return False
+        sample_n = 15
+        idx_a = np.linspace(0, len(path_a) - 1, min(sample_n, len(path_a))).astype(int)
+        idx_b = np.linspace(0, len(path_b) - 1, min(sample_n, len(path_b))).astype(int)
+        pts_a = [path_a[i] for i in idx_a]
+        pts_b = [path_b[i] for i in idx_b]
+        close_count = 0
+        for pa in pts_a:
+            if any(np.hypot(pa[0] - pb[0], pa[1] - pb[1]) < 15 for pb in pts_b):
+                close_count += 1
+        return (close_count / len(pts_a)) >= threshold_ratio
+
     if search_cost[start] >= 9999 or search_cost[goal] >= 9999:
         st.error("⚠️ スタートまたはゴールが『完全な場外』にあります。地図の内側をクリックしてください。")
     else:
-        path1 = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, goal)
-        if path1 and len(path1) > 1:
-            routes.append((path1, (0, 0, 255)))
-            metrics.append({"名前": "AI 最適解", "色": "🔴 赤", "スコア": round(sum(small_cost[p[0], p[1]] for p in path1), 1)})
+        # ① AI最適解（標準コストでのDijkstra最短経路）
+        try:
+            path1 = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, goal)
+            if path1 and len(path1) > 1:
+                routes.append((path1, (0, 0, 255), "実線"))
+                metrics.append({"名前": "① AI 最適解", "色": "🔴 赤", "スコア": round(sum(small_cost[p[0], p[1]] for p in path1), 1)})
+        except Exception as e:
+            st.warning(f"AI最適解の計算でエラーが発生しました: {e}")
+            path1 = None
 
-        best_ap = min(attack_points, key=lambda p: np.hypot(p[0]-goal[0], p[1]-goal[1])) if attack_points else None
-        if best_ap and search_cost[best_ap] < 9999:
-            path_to_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, best_ap)
-            path_from_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, best_ap, goal)
-            if path_to_ap and path_from_ap:
-                path2 = path_to_ap[:-1] + path_from_ap
-                routes.append((path2, (255, 0, 0)))
-                metrics.append({"名前": "AP 経由", "色": "🔵 青", "スコア": round(sum(small_cost[p[0], p[1]] for p in path2), 1)})
+        # ② 直進ルート（道を無視して直線で突っ切った場合の基準線）
+        try:
+            straight_path = get_straight_line_path(search_cost, start, goal)
+            if straight_path and len(straight_path) > 1:
+                routes.append((straight_path, (0, 220, 255), "破線"))  # 黄色(BGR)
+                straight_score = sum(
+                    small_cost[p[0], p[1]] if small_cost[p[0], p[1]] < 9999 else 50.0
+                    for p in straight_path
+                )
+                metrics.append({"名前": "② 直進ルート", "色": "🟡 黄", "スコア": round(straight_score, 1)})
+        except Exception as e:
+            st.warning(f"直進ルートの計算でエラーが発生しました: {e}")
+
+        # ③ 道優先ルート（多少遠回りでも歩きやすい場所を通る）
+        try:
+            road_path = dijkstra(road_search_cost, grad_x, grad_y, grad_mag, start, goal)
+            if road_path and len(road_path) > 1:
+                if path1 and paths_are_similar(path1, road_path):
+                    # 最適解とほぼ同じルートになった場合は重複として表示しない
+                    pass
+                else:
+                    routes.append((road_path, (0, 180, 0), "実線"))  # 緑(BGR)
+                    road_score = round(sum(small_cost[p[0], p[1]] for p in road_path), 1)
+                    metrics.append({"名前": "③ 道優先ルート", "色": "🟢 緑", "スコア": road_score})
+        except Exception as e:
+            st.warning(f"道優先ルートの計算でエラーが発生しました: {e}")
+
+        # ④ 複数アタックポイント経由ルート（ゴール付近の異なる進入方向を比較）
+        try:
+            diverse_aps = pick_diverse_attack_points(attack_points, goal, start, search_cost, top_n=3)
+        except Exception as e:
+            st.warning(f"アタックポイント選定でエラーが発生しました: {e}")
+            diverse_aps = []
+
+        ap_colors = [(255, 0, 0), (255, 120, 0), (255, 0, 200)]  # 青、オレンジ系、紫系(BGR)
+        ap_labels = ["④ AP経由-A", "⑤ AP経由-B", "⑥ AP経由-C"]
+        ap_emojis = ["🔵 青", "🟠 橙", "🟣 紫"]
+
+        existing_paths_for_dedup = [r[0] for r in routes]
+        for idx, ap in enumerate(diverse_aps):
+            try:
+                path_to_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, start, ap)
+                path_from_ap = dijkstra(search_cost, grad_x, grad_y, grad_mag, ap, goal)
+                if path_to_ap and path_from_ap:
+                    ap_path = path_to_ap[:-1] + path_from_ap
+                    # 既に表示する予定の他ルートとほぼ重複していたらスキップ
+                    if any(paths_are_similar(ap_path, existing) for existing in existing_paths_for_dedup):
+                        continue
+                    routes.append((ap_path, ap_colors[idx % len(ap_colors)], "実線"))
+                    existing_paths_for_dedup.append(ap_path)
+                    ap_score = round(sum(small_cost[p[0], p[1]] for p in ap_path), 1)
+                    metrics.append({"名前": ap_labels[idx], "色": ap_emojis[idx], "スコア": ap_score})
+            except Exception as e:
+                st.warning(f"アタックポイント経由ルート({ap_labels[idx]})の計算でエラーが発生しました: {e}")
+
+        if len(routes) <= 1:
+            st.caption("ℹ️ 一部のルートは最適解と重複していたため非表示にしています。スタート/ゴールの位置を変えると複数ルートが見えやすくなる場合があります。")
 
     vis = cv2.imdecode(np.asarray(bytearray(file_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
     h_orig, w_orig = vis.shape[:2]
@@ -535,9 +707,25 @@ if uploaded_file is not None:
     cv2.circle(vis, orig_goal, 30, (255, 0, 255), 5)
     cv2.circle(vis, orig_goal, 18, (255, 0, 255), 3)
 
-    for path, color in reversed(routes):
-        for j in range(len(path) - 1):
-            cv2.line(vis, (int(path[j][1]*scale_inv), int(path[j][0]*scale_inv)), (int(path[j+1][1]*scale_inv), int(path[j+1][0]*scale_inv)), color, thickness=4)
+    for path, color, style in reversed(routes):
+        if style == "破線":
+            # 一定間隔で線を間引いて描画することで破線に見せる
+            for j in range(0, len(path) - 1, 2):
+                if j + 1 < len(path):
+                    cv2.line(
+                        vis,
+                        (int(path[j][1] * scale_inv), int(path[j][0] * scale_inv)),
+                        (int(path[j + 1][1] * scale_inv), int(path[j + 1][0] * scale_inv)),
+                        color, thickness=3
+                    )
+        else:
+            for j in range(len(path) - 1):
+                cv2.line(
+                    vis,
+                    (int(path[j][1] * scale_inv), int(path[j][0] * scale_inv)),
+                    (int(path[j + 1][1] * scale_inv), int(path[j + 1][0] * scale_inv)),
+                    color, thickness=4
+                )
 
     with col_map:
         vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
