@@ -543,7 +543,7 @@ if 'last_click' not in st.session_state:
 col_panel, col_map = st.columns([1, 3])
 
 with col_panel:
-    st.markdown("### 🧭 Livelox風 解析AI")
+    st.markdown("### 🧭 ルート解析AI")
     with st.expander("📂 地図とGPSの読み込み", expanded=True):
         uploaded_file = st.file_uploader("地図画像 (必須)", type=["png", "jpg", "jpeg"])
         gpx_file = st.file_uploader("GPSログ (.gpx)", type=["gpx"])
